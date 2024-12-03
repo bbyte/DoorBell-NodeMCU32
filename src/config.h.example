@@ -1,0 +1,36 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// WiFi Configuration
+#define WIFI_SSID "your_wifi_ssid"
+#define WIFI_PASSWORD "your_wifi_password"
+#define BACKUP_WIFI_SSID "your_backup_wifi_ssid"
+#define BACKUP_WIFI_PASSWORD "your_backup_wifi_password"
+
+// MQTT Configuration
+#define MQTT_SERVER "192.168.1.xxx"
+#define MQTT_PORT 1883
+#define BACKUP_MQTT_SERVER "backup.mqtt.server"
+#define BACKUP_MQTT_PORT 1883
+#define MQTT_USER "your_mqtt_username"
+#define MQTT_PASSWORD "your_mqtt_password"
+
+// OTA Configuration
+#define OTA_PASSWORD "your_ota_password"
+#define OTA_HOSTNAME "DoorBell"
+
+// Audio Configuration
+#define DOWNSTAIRS_TRACK 1
+#define DOOR_TRACK 2
+#define EMERGENCY_TRACK 3
+#define DEFAULT_VOLUME 20
+#define EMERGENCY_VOLUME 30
+
+// Emergency Configuration
+#define EMERGENCY_DURATION 300  // Duration in seconds (0 = indefinite)
+#define PANIC_PRESS_THRESHOLD 3 // Number of presses to trigger panic
+#define PANIC_WINDOW 5         // Window in seconds for panic detection
+#define BUTTON_COOLDOWN_MS 15000 // Cooldown period in milliseconds
+#define VOLUME_RESET_MS 60000   // Time after which volume resets
+
+#endif // CONFIG_H
