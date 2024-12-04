@@ -21,8 +21,8 @@
 #endif
 
 // Pin definitions
-const int BUTTON_DOWNSTAIRS = 14;  // GPIO14 for downstairs button
-const int BUTTON_DOOR = 27;         // GPI27 for door button
+const int BUTTON_DOWNSTAIRS = 27;  // GPIO27 for downstairs button
+const int BUTTON_DOOR = 14;         // GPIO14 for door button
 const int DFPLAYER_RX = 16;        // GPIO16 for DFPlayer RX
 const int DFPLAYER_TX = 17;        // GPIO17 for DFPlayer TX
 // Built-in LED pin is already defined in framework
@@ -49,11 +49,11 @@ struct Config {
     char mqtt_password[32];
     uint8_t downstairs_track;
     uint8_t door_track;
-    uint8_t downstairs_volume;
-    uint8_t door_volume;
+    uint8_t downstairs_volume; // Volume in percentage (0-100)
+    uint8_t door_volume;       // Volume in percentage (0-100)
     // Emergency configuration
     uint8_t emergency_track;
-    uint8_t emergency_volume;
+    uint8_t emergency_volume;  // Volume in percentage (0-100)
     uint16_t emergency_duration;     // Duration in seconds (0 = indefinite)
     uint8_t panic_press_threshold;   // Number of presses to trigger panic
     uint16_t panic_window;          // Window in seconds for panic detection
@@ -72,6 +72,11 @@ HardwareSerial dfPlayerSerial(2); // Using UART2
 // Button debounce variables
 unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 200;
+unsigned long buttonDownstairsPressStart = 0;  // Track when downstairs button started being pressed
+unsigned long buttonDoorPressStart = 0;        // Track when door button started being pressed
+const unsigned long BUTTON_PRESS_DURATION = 800;  // Duration required for a valid button press
+bool buttonDownstairsWasPressed = false;     // Track if button was previously pressed
+bool buttonDoorWasPressed = false;           // Track if button was previously pressed
 
 // Global variables
 bool emergencyMode = false;
@@ -82,20 +87,27 @@ unsigned long emergencyStartTime = 0;    // When emergency mode was activated
 unsigned long lastPlayTime = 0;          // Last time a melody was played
 unsigned long volumeResetTimer = 0;      // Timer for volume reset
 bool isPlaying = false;                  // Track if currently playing
+unsigned long ledStartTime = 0;          // When LED started flashing for normal play
+bool normalLedOn = false;                // Track if LED is on for normal play
 
 // Add structure for pending play requests
 struct PlayRequest {
     bool pending;
     int track;
-    int volume;
+    int volume; // Volume in percentage (0-100)
 } playRequest = {false, 0, 0};
+
+// Helper function to convert percentage volume to DFPlayer volume (0-30)
+uint8_t percentToVolume(uint8_t percent) {
+    return (percent * 30) / 100;
+}
 
 // Function declarations
 void setupWiFi();
 void setupOTA();
 void setupMQTT();
 void setupDFPlayer();
-void handleButton(int button, bool simulated = false);
+void handleButton(int button, bool simulated);
 void callback(char* topic, byte* payload, unsigned int length);
 void reconnect();
 void loadConfig();
@@ -143,7 +155,7 @@ void setup() {
     ArduinoOTA.setHostname("doorbell");
     ArduinoOTA.setPort(3232);
     
-    ArduinoOTA.setPassword("darkestofthedarkiest");
+    ArduinoOTA.setPassword(OTA_PASSWORD);
     
     ArduinoOTA.onStart([]() {
         String type;
@@ -221,7 +233,7 @@ void loop() {
 
         // Only play if not already playing or cooldown has passed
         if (!isPlaying || (currentTime - lastPlayTime >= config.button_cooldown_ms)) {
-            dfPlayer.volume(playRequest.volume);
+            dfPlayer.volume(percentToVolume(playRequest.volume));
             dfPlayer.play(playRequest.track);
             lastPlayTime = currentTime;
             volumeResetTimer = currentTime;
@@ -247,19 +259,56 @@ void loop() {
             // Auto-disable emergency mode
             emergencyMode = false;
             dfPlayer.stop();
-            dfPlayer.volume(config.door_volume); // Reset to normal volume
+            dfPlayer.volume(percentToVolume(config.door_volume)); // Reset to normal volume
             digitalWrite(LED_BUILTIN, LOW);
             mqtt.publish("doorbell/status", "{\"emergency\": false, \"message\": \"Emergency mode auto-disabled after timeout\"}");
         }
     }
 
+    // Handle LED for normal play (non-emergency)
+    if (normalLedOn && !emergencyMode) {
+        if (millis() - ledStartTime >= 5000) {  // 5 seconds passed
+            digitalWrite(LED_BUILTIN, LOW);  // Turn off LED
+            normalLedOn = false;
+        }
+    }
+
     // Check buttons only if not in emergency mode
     if (!emergencyMode) {
-        if (digitalRead(BUTTON_DOWNSTAIRS) == HIGH) {
-            handleButton(BUTTON_DOWNSTAIRS);
+        unsigned long currentTime = millis();
+        
+        // Handle downstairs button
+        bool downstairsState = digitalRead(BUTTON_DOWNSTAIRS) == HIGH;
+        if (downstairsState && !buttonDownstairsWasPressed) {
+            // Button just pressed - record start time
+            buttonDownstairsPressStart = currentTime;
+            buttonDownstairsWasPressed = true;
+        } else if (downstairsState && buttonDownstairsWasPressed) {
+            // Button is still pressed - check duration
+            if (currentTime - buttonDownstairsPressStart >= BUTTON_PRESS_DURATION) {
+                handleButton(BUTTON_DOWNSTAIRS, false);
+                buttonDownstairsPressStart = currentTime;  // Reset start time to prevent multiple triggers
+            }
+        } else if (!downstairsState && buttonDownstairsWasPressed) {
+            // Button was released
+            buttonDownstairsWasPressed = false;
         }
-        if (digitalRead(BUTTON_DOOR) == HIGH) {
-            handleButton(BUTTON_DOOR);
+        
+        // Handle door button
+        bool doorState = digitalRead(BUTTON_DOOR) == HIGH;
+        if (doorState && !buttonDoorWasPressed) {
+            // Button just pressed - record start time
+            buttonDoorPressStart = currentTime;
+            buttonDoorWasPressed = true;
+        } else if (doorState && buttonDoorWasPressed) {
+            // Button is still pressed - check duration
+            if (currentTime - buttonDoorPressStart >= BUTTON_PRESS_DURATION) {
+                handleButton(BUTTON_DOOR, false);
+                buttonDoorPressStart = currentTime;  // Reset start time to prevent multiple triggers
+            }
+        } else if (!doorState && buttonDoorWasPressed) {
+            // Button was released
+            buttonDoorWasPressed = false;
         }
     }
 }
@@ -399,7 +448,7 @@ void handleButton(int button, bool simulated) {
                     // Trigger emergency mode
                     emergencyMode = true;
                     emergencyStartTime = currentTime;  // Start emergency timer
-                    dfPlayer.volume(config.emergency_volume);
+                    dfPlayer.volume(percentToVolume(config.emergency_volume));
                     dfPlayer.loop(config.emergency_track);
                     digitalWrite(LED_BUILTIN, HIGH);
                     
@@ -433,19 +482,27 @@ void handleButton(int button, bool simulated) {
         }
 
         if (button == BUTTON_DOWNSTAIRS) {
-            dfPlayer.volume(config.downstairs_volume);
+            dfPlayer.volume(percentToVolume(config.downstairs_volume));
             dfPlayer.play(config.downstairs_track);
             mqtt.publish("doorbell/event", "downstairs");
             lastPlayTime = currentTime;
             volumeResetTimer = currentTime;
             isPlaying = true;
+            // Turn on LED for 5 seconds
+            digitalWrite(LED_BUILTIN, HIGH);
+            ledStartTime = currentTime;
+            normalLedOn = true;
         } else if (button == BUTTON_DOOR) {
-            dfPlayer.volume(config.door_volume);
+            dfPlayer.volume(percentToVolume(config.door_volume));
             dfPlayer.play(config.door_track);
             mqtt.publish("doorbell/event", "door");
             lastPlayTime = currentTime;
             volumeResetTimer = currentTime;
             isPlaying = true;
+            // Turn on LED for 5 seconds
+            digitalWrite(LED_BUILTIN, HIGH);
+            ledStartTime = currentTime;
+            normalLedOn = true;
         }
     }
 }
@@ -520,7 +577,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
             mqtt.publish("doorbell/debug", "Queueing track to play");
             playRequest.pending = true;
             playRequest.track = track;
-            playRequest.volume = 30; // max volume
+            playRequest.volume = 100; // max volume in percentage
         }
         return;
     }
@@ -530,7 +587,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
         if (strcmp(message, "ON") == 0 && !emergencyMode) {
             emergencyMode = true;
             emergencyStartTime = millis();  // Start emergency timer
-            dfPlayer.volume(config.emergency_volume);
+            dfPlayer.volume(percentToVolume(config.emergency_volume));
             dfPlayer.loop(config.emergency_track);
             digitalWrite(LED_BUILTIN, HIGH);
             mqtt.publish("doorbell/status", "{\"emergency\": true, \"message\": \"Emergency mode activated\"}");
@@ -538,7 +595,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
         else if (strcmp(message, "OFF") == 0 && emergencyMode) {
             emergencyMode = false;
             dfPlayer.stop();
-            dfPlayer.volume(config.door_volume); // Reset to normal volume
+            dfPlayer.volume(percentToVolume(config.door_volume)); // Reset to normal volume
             digitalWrite(LED_BUILTIN, LOW);
             mqtt.publish("doorbell/status", "{\"emergency\": false, \"message\": \"Emergency mode deactivated\"}");
         }
@@ -574,7 +631,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
         if (doc.containsKey("volume")) {
             config.downstairs_volume = doc["volume"];
             char debug_msg[64];
-            snprintf(debug_msg, sizeof(debug_msg), "Set downstairs volume to %d", config.downstairs_volume);
+            snprintf(debug_msg, sizeof(debug_msg), "Set downstairs volume to %d%%", config.downstairs_volume);
             mqtt.publish("doorbell/debug", debug_msg);
         }
         saveConfig();
@@ -590,7 +647,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
         if (doc.containsKey("volume")) {
             config.door_volume = doc["volume"];
             char debug_msg[64];
-            snprintf(debug_msg, sizeof(debug_msg), "Set door volume to %d", config.door_volume);
+            snprintf(debug_msg, sizeof(debug_msg), "Set door volume to %d%%", config.door_volume);
             mqtt.publish("doorbell/debug", debug_msg);
         }
         saveConfig();
@@ -707,12 +764,12 @@ void loadConfig() {
         
         config.downstairs_track = 1;
         config.door_track = 2;
-        config.downstairs_volume = 20;
-        config.door_volume = 20;
+        config.downstairs_volume = 50; // Default volume in percentage
+        config.door_volume = 50;       // Default volume in percentage
         
         // Default emergency settings
         config.emergency_track = 99;
-        config.emergency_volume = 30;
+        config.emergency_volume = 100; // Default volume in percentage
         config.emergency_duration = 60;    // 1 minute default
         config.panic_press_threshold = 5;  // 5 presses
         config.panic_window = 20;         // 20 seconds window

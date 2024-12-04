@@ -28,7 +28,7 @@ This project implements a smart doorbell system using NodeMCU32S and DFPlayer Mi
 - WiFi connectivity with backup configuration
 - MQTT communication with backup server
 - OTA (Over-The-Air) updates
-- Configurable tracks and volume for each button
+- Configurable tracks and volume for each button (volume in percentage 0-100%)
 - Persistent configuration storage in EEPROM
 - Fallback functionality when offline
 
@@ -60,14 +60,14 @@ This project implements a smart doorbell system using NodeMCU32S and DFPlayer Mi
   ```json
   {
     "track": 1,
-    "volume": 20
+    "volume": 50  // Volume in percentage (0-100)
   }
   ```
 - `doorbell/set/button/door` - Configure door button
   ```json
   {
     "track": 2,
-    "volume": 25
+    "volume": 50  // Volume in percentage (0-100)
   }
   ```
 
@@ -82,7 +82,7 @@ This project implements a smart doorbell system using NodeMCU32S and DFPlayer Mi
   ```json
   {
     "track": 10,
-    "volume": 30,
+    "volume": 100,  // Volume in percentage (0-100)
     "duration": 300,
     "panic_threshold": 5,
     "panic_window": 60,
@@ -153,7 +153,7 @@ mosquitto_pub -t "doorbell/get/config" -m ""
 
 2. Set door button configuration:
 ```bash
-mosquitto_pub -t "doorbell/set/button/door" -m '{"track": 1, "volume": 25}'
+mosquitto_pub -t "doorbell/set/button/door" -m '{"track": 1, "volume": 50}'
 ```
 
 3. Activate emergency mode:
@@ -163,7 +163,7 @@ mosquitto_pub -t "doorbell/emergency" -m "ON"
 
 4. Configure emergency settings:
 ```bash
-mosquitto_pub -t "doorbell/set/emergency" -m '{"track": 10, "volume": 30, "duration": 300, "panic_threshold": 5, "panic_window": 60}'
+mosquitto_pub -t "doorbell/set/emergency" -m '{"track": 10, "volume": 100, "duration": 300, "panic_threshold": 5, "panic_window": 60}'
 ```
 
 5. Play specific track:
@@ -178,11 +178,17 @@ mosquitto_sub -t "doorbell/#" -v
 
 ## Message Formats
 
+### Volume Control
+All volume settings in the system are specified as percentages (0-100%). The system automatically converts these percentages to the appropriate hardware values for the DFPlayer Mini module (0-30). For example:
+- 50% volume → 15 on DFPlayer
+- 100% volume → 30 on DFPlayer
+- 0% volume → 0 on DFPlayer
+
 ### Button Configuration
 ```json
 {
     "track": 1,
-    "volume": 20
+    "volume": 50  // Volume in percentage (0-100)
 }
 ```
 
@@ -190,7 +196,7 @@ mosquitto_sub -t "doorbell/#" -v
 ```json
 {
     "track": 1,
-    "volume": 20
+    "volume": 50  // Volume in percentage (0-100)
 }
 ```
 
