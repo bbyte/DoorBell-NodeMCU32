@@ -47,6 +47,7 @@ Note: The analog detection algorithm may need adjustment for different building 
 - Configurable tracks and volume for each button (volume in percentage 0-100%)
 - Persistent configuration storage in EEPROM
 - Fallback functionality when offline
+- Timer functionality for scheduling events
 
 ## MQTT Topics and Commands
 
@@ -121,6 +122,21 @@ Note: The analog detection algorithm may need adjustment for different building 
   }
   ```
 
+#### Timer Control
+- `doorbell/timer/set` - Set a new timer
+  ```json
+  {
+    "seconds": 126,    // Duration in seconds
+    "track": 1,        // Track to play when timer ends
+    "volume": 100      // Volume in percentage (0-100)
+  }
+  ```
+- `doorbell/timer/stop` - Stop the current timer
+  - No payload required
+  ```bash
+  mosquitto_pub -t "doorbell/timer/stop" -m ""
+  ```
+
 ### Publish Topics (Device to Server)
 
 - `doorbell/status` - Device status updates
@@ -140,6 +156,39 @@ Note: The analog detection algorithm may need adjustment for different building 
 - `doorbell/debug` - Debug messages from the device
   - Contains various operational messages and command confirmations
 
+- `doorbell/timer/status` - Timer status updates
+  ```json
+  // Timer started
+  {
+    "status": "started",
+    "seconds": 126,
+    "track": 1,
+    "volume": 100
+  }
+  ```
+  ```json
+  // Timer ended
+  {
+    "status": "ended",
+    "seconds": 126,
+    "track": 1,
+    "volume": 100
+  }
+  ```
+  ```json
+  // Timer stopped
+  {
+    "status": "stopped"
+  }
+  ```
+  ```json
+  // Timer error
+  {
+    "status": "error",
+    "message": "Timer already active"
+  }
+  ```
+
 ### Testing Examples
 
 1. Get current configuration:
@@ -157,7 +206,12 @@ mosquitto_pub -t "doorbell/set/button/door" -m '{"track": 1, "volume": 50}'
 mosquitto_pub -t "doorbell/play/1" -m ""
 ```
 
-4. Monitor all device messages:
+4. Set a new timer:
+```bash
+mosquitto_pub -t "doorbell/timer/set" -m '{"seconds": 126, "track": 1, "volume": 100}'
+```
+
+5. Monitor all device messages:
 ```bash
 mosquitto_sub -t "doorbell/#" -v
 ```

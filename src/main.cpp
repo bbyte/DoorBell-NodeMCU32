@@ -97,6 +97,15 @@ struct PlayRequest {
     int volume;  // Volume in percentage (0-100)
 } playRequest;
 
+// Timer structure
+struct Timer {
+    bool active;
+    unsigned long startTime;
+    unsigned long durationMs;
+    int track;
+    int volume;
+} timer = {false, 0, 0, 0, 0};
+
 // Global variables for session tracking
 #ifdef INPUT_MODE_ANALOG
 ADCSession currentSession = {0, 0, false, 0.0, -1, 0};
@@ -308,6 +317,27 @@ void loop() {
 
     currentTime = millis();  // Update current time
 
+    // Check timer
+    if (timer.active) {
+        unsigned long elapsed = currentTime - timer.startTime;
+        if (elapsed >= timer.durationMs) {
+            timer.active = false;
+            
+            // Play the specified track
+            playRequest.pending = true;
+            playRequest.track = timer.track;
+            playRequest.volume = timer.volume;
+            
+            // Publish timer ended message
+            char endMsg[128];
+            snprintf(endMsg, sizeof(endMsg), 
+                    "{\"status\":\"ended\",\"seconds\":%lu,\"track\":%d,\"volume\":%d}", 
+                    timer.durationMs/1000, timer.track, timer.volume);
+            mqtt.publish("doorbell/timer/status", endMsg);
+            MQTT_DEBUG("Timer ended, playing track");
+        }
+    }
+
     // Check if playback has finished
     if (currentTime - lastPlaybackCheck >= 200) {  // Still keep the 200ms check interval
         lastPlaybackCheck = currentTime;
@@ -508,6 +538,62 @@ void callback(char* topic, byte* payload, unsigned int length) {
         return;
     }
     
+    // Handle timer commands
+    else if (strcmp(topic_copy, "doorbell/timer/stop") == 0) {
+        if (timer.active) {
+            timer.active = false;
+            mqtt.publish("doorbell/timer/status", "{\"status\":\"stopped\"}");
+            MQTT_DEBUG("Timer stopped");
+        } else {
+            mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"No active timer\"}");
+            MQTT_DEBUG("Error: No active timer to stop");
+        }
+        return;
+    }
+    else if (strcmp(topic_copy, "doorbell/timer/set") == 0) {
+        DynamicJsonDocument timerDoc(200);
+        DeserializationError error = deserializeJson(timerDoc, message);
+        
+        if (error) {
+            mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
+            MQTT_DEBUG("Failed to parse timer JSON");
+            return;
+        }
+
+        if (timer.active) {
+            mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"Timer already active\"}");
+            MQTT_DEBUG("Error: Timer already active");
+            return;
+        }
+
+        if (!timerDoc.containsKey("seconds") || !timerDoc.containsKey("track") || !timerDoc.containsKey("volume")) {
+            mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"Missing required fields\"}");
+            MQTT_DEBUG("Error: Missing required timer fields");
+            return;
+        }
+
+        int seconds = timerDoc["seconds"].as<int>();
+        if (seconds <= 0) {
+            mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"Invalid duration\"}");
+            MQTT_DEBUG("Error: Invalid timer duration");
+            return;
+        }
+
+        timer.active = true;
+        timer.startTime = millis();
+        timer.durationMs = (unsigned long)seconds * 1000;
+        timer.track = timerDoc["track"].as<int>();
+        timer.volume = timerDoc["volume"].as<int>();
+
+        char statusMsg[128];
+        snprintf(statusMsg, sizeof(statusMsg), 
+                "{\"status\":\"started\",\"seconds\":%d,\"track\":%d,\"volume\":%d}", 
+                seconds, timer.track, timer.volume);
+        mqtt.publish("doorbell/timer/status", statusMsg);
+        MQTT_DEBUG_F("Timer started for %d seconds", seconds);
+        return;
+    }
+    
     // All remaining commands require JSON
     if (strncmp(topic_copy, "doorbell/set/", 12) != 0) {
         MQTT_DEBUG("Error: Unknown command");
@@ -620,6 +706,8 @@ void reconnect() {
             mqtt.subscribe("doorbell/play/#");
             // Subscribe to system commands
             mqtt.subscribe("doorbell/system/#");
+            // Subscribe to timer commands
+            mqtt.subscribe("doorbell/timer/#");
             
             publishDeviceStatus();
         } else {                
