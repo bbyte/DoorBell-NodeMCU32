@@ -15,12 +15,28 @@ This project implements a smart doorbell system using NodeMCU32S and DFPlayer Mi
 1. DFPlayer Mini:
    - RX -> GPIO16
    - TX -> GPIO17
+   - BUSY -> GPIO26 (Required for stable operation)
    - VCC -> 5V
    - GND -> GND
 
 2. Buttons:
    - Downstairs Button -> GPIO32 (and GND)
    - Door Button -> GPIO33 (and GND)
+
+## Operation Modes
+
+### Digital Mode
+The default mode uses digital input (0 or 1) for button detection. This is straightforward and works well with simple button setups where the input signal is clean and stable.
+
+### Analog Mode
+When connecting to an existing building doorbell system, the input signal might be unstable or have varying voltage levels. In analog mode, the system reads voltage values and uses an algorithm to analyze the input pattern to determine valid button presses.
+
+The current algorithm works by:
+- Monitoring voltage changes over time
+- Analyzing the pattern of voltage changes
+- Using thresholds and timing to determine valid button presses
+
+Note: The analog detection algorithm may need adjustment for different building systems as voltage patterns can vary. You can modify the thresholds and timing parameters in the configuration.
 
 ## Features
 
@@ -68,26 +84,6 @@ This project implements a smart doorbell system using NodeMCU32S and DFPlayer Mi
   {
     "track": 2,
     "volume": 50  // Volume in percentage (0-100)
-  }
-  ```
-
-#### Emergency Mode
-- `doorbell/emergency` - Control emergency mode
-  - Payload: "ON" to activate, "OFF" to deactivate
-  ```bash
-  mosquitto_pub -t "doorbell/emergency" -m "ON"
-  mosquitto_pub -t "doorbell/emergency" -m "OFF"
-  ```
-- `doorbell/set/emergency` - Configure emergency settings
-  ```json
-  {
-    "track": 10,
-    "volume": 100,  // Volume in percentage (0-100)
-    "duration": 300,
-    "panic_threshold": 5,
-    "panic_window": 60,
-    "button_cooldown_ms": 15000,
-    "volume_reset_ms": 60000
   }
   ```
 
@@ -156,22 +152,12 @@ mosquitto_pub -t "doorbell/get/config" -m ""
 mosquitto_pub -t "doorbell/set/button/door" -m '{"track": 1, "volume": 50}'
 ```
 
-3. Activate emergency mode:
-```bash
-mosquitto_pub -t "doorbell/emergency" -m "ON"
-```
-
-4. Configure emergency settings:
-```bash
-mosquitto_pub -t "doorbell/set/emergency" -m '{"track": 10, "volume": 100, "duration": 300, "panic_threshold": 5, "panic_window": 60}'
-```
-
-5. Play specific track:
+3. Play specific track:
 ```bash
 mosquitto_pub -t "doorbell/play/1" -m ""
 ```
 
-6. Monitor all device messages:
+4. Monitor all device messages:
 ```bash
 mosquitto_sub -t "doorbell/#" -v
 ```
@@ -239,7 +225,6 @@ The device will be available as "doorbell.local" for OTA updates. You can update
    - MQTT server details (primary and backup)
    - OTA password
    - Audio configuration
-   - Emergency settings
 
 The `config.h` file is ignored by git to keep your personal settings private.
 
@@ -266,13 +251,4 @@ The `config.h` file is ignored by git to keep your personal settings private.
 ### Audio Configuration
 - `DOWNSTAIRS_TRACK` - Track number for downstairs button
 - `DOOR_TRACK` - Track number for door button
-- `EMERGENCY_TRACK` - Track number for emergency mode
 - `DEFAULT_VOLUME` - Default volume level
-- `EMERGENCY_VOLUME` - Volume level for emergency mode
-
-### Emergency Settings
-- `EMERGENCY_DURATION` - Duration of emergency mode in seconds (0 = indefinite)
-- `PANIC_PRESS_THRESHOLD` - Number of presses to trigger panic mode
-- `PANIC_WINDOW` - Time window for panic press detection
-- `BUTTON_COOLDOWN_MS` - Button cooldown period
-- `VOLUME_RESET_MS` - Time until volume resets to default

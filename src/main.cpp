@@ -8,16 +8,21 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include "config.h"
+#include "input_config.h"
 
 // Debug macros
 #ifdef DEBUG_ENABLE
-    #define DEBUG_PRINT(x) Serial.print(x)
-    #define DEBUG_PRINTLN(x) Serial.println(x)
-    #define DEBUG_PRINTF(x, ...) Serial.printf(x, __VA_ARGS__)
+    #define DEBUG_PRINT(x) if (config.debug_enabled) Serial.print(x)
+    #define DEBUG_PRINTLN(x) if (config.debug_enabled) Serial.println(x)
+    #define DEBUG_PRINTF(x, ...) if (config.debug_enabled) Serial.printf(x, __VA_ARGS__)
+    #define MQTT_DEBUG(x) if (config.debug_enabled) mqtt.publish("doorbell/debug", x)
+    #define MQTT_DEBUG_F(...) if (config.debug_enabled) { char debug_msg[512]; snprintf(debug_msg, sizeof(debug_msg), __VA_ARGS__); mqtt.publish("doorbell/debug", debug_msg); }
 #else
     #define DEBUG_PRINT(x)
     #define DEBUG_PRINTLN(x)
     #define DEBUG_PRINTF(x, ...)
+    #define MQTT_DEBUG(x)
+    #define MQTT_DEBUG_F(...)
 #endif
 
 // Pin definitions
@@ -25,10 +30,10 @@ const int BUTTON_DOWNSTAIRS = 27;  // GPIO27 for downstairs button
 const int BUTTON_DOOR = 14;         // GPIO14 for door button
 const int DFPLAYER_RX = 16;        // GPIO16 for DFPlayer RX
 const int DFPLAYER_TX = 17;        // GPIO17 for DFPlayer TX
+const int DFPLAYER_BUSY = 26;      // GPIO26 for DFPlayer BUSY pin
+const int ADC_PIN1 = 32;           // GPIO32 for ADC reading
+const int ADC_PIN2 = 33;           // GPIO33 for ADC reading
 // Built-in LED pin is already defined in framework
-
-// Emergency mode settings
-const int EMERGENCY_LED_INTERVAL = 200; // LED flash interval in ms
 
 // EEPROM size and addresses
 #define EEPROM_SIZE 512
@@ -49,16 +54,11 @@ struct Config {
     char mqtt_password[32];
     uint8_t downstairs_track;
     uint8_t door_track;
-    uint8_t downstairs_volume; // Volume in percentage (0-100)
-    uint8_t door_volume;       // Volume in percentage (0-100)
-    // Emergency configuration
-    uint8_t emergency_track;
-    uint8_t emergency_volume;  // Volume in percentage (0-100)
-    uint16_t emergency_duration;     // Duration in seconds (0 = indefinite)
-    uint8_t panic_press_threshold;   // Number of presses to trigger panic
-    uint16_t panic_window;          // Window in seconds for panic detection
-    uint16_t button_cooldown_ms;    // Cooldown period in milliseconds (default 15000)
-    uint16_t volume_reset_ms;       // Time after which volume resets to 0 (default 60000)
+    uint8_t downstairs_volume;     // Volume in percentage (0-100)
+    uint8_t door_volume;           // Volume in percentage (0-100)
+    uint16_t button_cooldown_ms;   // Cooldown period in milliseconds (default 15000)
+    uint16_t volume_reset_ms;      // Time after which volume resets to 0 (default 60000)
+    bool debug_enabled;            // MQTT-controlled debug flag
 };
 
 Config config;
@@ -69,45 +69,44 @@ PubSubClient mqtt(espClient);
 DFRobotDFPlayerMini dfPlayer;
 HardwareSerial dfPlayerSerial(2); // Using UART2
 
-// Button debounce variables
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 200;
-unsigned long buttonDownstairsPressStart = 0;  // Track when downstairs button started being pressed
-unsigned long buttonDoorPressStart = 0;        // Track when door button started being pressed
-const unsigned long BUTTON_PRESS_DURATION = 800;  // Duration required for a valid button press
-bool buttonDownstairsWasPressed = false;     // Track if button was previously pressed
-bool buttonDoorWasPressed = false;           // Track if button was previously pressed
+// Global variables for button states and timing
+struct ButtonState {
+    bool isPressed;
+    bool wasPressed;
+    unsigned long pressStartTime;
+    unsigned long lastValidPressTime;
+    bool isValidPress;
+};
 
-// Global variables
-bool emergencyMode = false;
-unsigned long lastEmergencyLedToggle = 0;
-unsigned long firstPressTime = 0;        // Time of first press in current sequence
-int pressCount = 0;                      // Count of presses in current window
-unsigned long emergencyStartTime = 0;    // When emergency mode was activated
-unsigned long lastPlayTime = 0;          // Last time a melody was played
-unsigned long volumeResetTimer = 0;      // Timer for volume reset
-bool isPlaying = false;                  // Track if currently playing
-unsigned long ledStartTime = 0;          // When LED started flashing for normal play
-bool normalLedOn = false;                // Track if LED is on for normal play
+ButtonState buttonStates[2];  // Index 0 for DOWNSTAIRS, 1 for DOOR
+
+// Global variables for timing and state
+unsigned long lastPlayTime = 0;
+unsigned long volumeResetTimer = 0;
+unsigned long ledStartTime = 0;
+unsigned long lastAdcRead = 0;      // Timestamp for last ADC reading
+unsigned long currentTime = 0;      // Current time in milliseconds
+unsigned long lastPlaybackCheck = 0;  // New variable to track last playback check
+bool isPlaying = false;
+bool normalLedOn = false;
 
 // Add structure for pending play requests
 struct PlayRequest {
     bool pending;
     int track;
-    int volume; // Volume in percentage (0-100)
-} playRequest = {false, 0, 0};
+    int volume;  // Volume in percentage (0-100)
+} playRequest;
 
-// Helper function to convert percentage volume to DFPlayer volume (0-30)
-uint8_t percentToVolume(uint8_t percent) {
-    return (percent * 30) / 100;
-}
+// Global variables for session tracking
+#ifdef INPUT_MODE_ANALOG
+ADCSession currentSession = {0, 0, false, 0.0, -1, 0};
+unsigned long lastValidVoltage = 0;  // Timestamp of last valid voltage reading
+#endif
 
 // Function declarations
 void setupWiFi();
-void setupOTA();
 void setupMQTT();
 void setupDFPlayer();
-void handleButton(int button, bool simulated);
 void callback(char* topic, byte* payload, unsigned int length);
 void reconnect();
 void loadConfig();
@@ -115,9 +114,71 @@ void saveConfig();
 void publishConfig();
 void clearEEPROM();
 void publishDeviceStatus();
+void checkButtons();
+void handleNormalDoorbell(int buttonIndex);
+void handleSimulatedButton(int button);
+void checkADC();
+
+// Helper function to convert percentage volume to DFPlayer volume (0-30)
+uint8_t percentToVolume(uint8_t percent) {
+    return (percent * 30) / 100;
+}
+
+// Function to check if a button press is valid
+bool isValidButtonPress(ButtonState& state, unsigned long currentTime) {
+    if (state.isPressed && !state.wasPressed) {
+        // Button just pressed
+        state.pressStartTime = currentTime;
+        state.wasPressed = true;
+        state.isValidPress = false;
+    } 
+    else if (state.isPressed && state.wasPressed) {
+        // Button is still pressed - check duration
+        if (currentTime - state.pressStartTime >= 200) {
+            state.isValidPress = true;
+            state.lastValidPressTime = currentTime;
+        }
+    }
+    else if (!state.isPressed && state.wasPressed) {
+        // Button was released
+        state.wasPressed = false;
+        state.isValidPress = false;
+    }
+    
+    return state.isValidPress;
+}
+
+// Function to check all buttons and return their states
+void checkButtons() {
+    static int prevDownstairsState = -1;  // Initialize to -1 to ensure first read is always sent
+    static int prevDoorState = -1;
+    unsigned long currentTime = currentTime;
+    
+    // Check downstairs button
+    int downstairsState = digitalRead(BUTTON_DOWNSTAIRS);
+    buttonStates[0].isPressed = downstairsState == HIGH;
+    bool downstairsValid = isValidButtonPress(buttonStates[0], currentTime);
+    if (downstairsState != prevDownstairsState) {
+        MQTT_DEBUG_F("Downstairs button: digitalRead=%d, isPressed=%d, wasPressed=%d, isValid=%d", 
+                     downstairsState, buttonStates[0].isPressed, buttonStates[0].wasPressed, downstairsValid);
+        prevDownstairsState = downstairsState;
+    }
+    
+    // Check door button
+    int doorState = digitalRead(BUTTON_DOOR);
+    buttonStates[1].isPressed = doorState == HIGH;
+    bool doorValid = isValidButtonPress(buttonStates[1], currentTime);
+    if (doorState != prevDoorState) {
+        MQTT_DEBUG_F("Door button: digitalRead=%d, isPressed=%d, wasPressed=%d, isValid=%d", 
+                     doorState, buttonStates[1].isPressed, buttonStates[1].wasPressed, doorValid);
+        prevDoorState = doorState;
+    }
+}
 
 void setup() {
     Serial.begin(115200);
+
+    MQTT_DEBUG_F("Starting Doorbell...");
     
     // Initialize EEPROM
     EEPROM.begin(EEPROM_SIZE);
@@ -126,11 +187,19 @@ void setup() {
     pinMode(BUTTON_DOWNSTAIRS, INPUT_PULLDOWN);
     pinMode(BUTTON_DOOR, INPUT_PULLDOWN);
     pinMode(LED_BUILTIN, OUTPUT);
+    pinMode(DFPLAYER_BUSY, INPUT);  // Configure BUSY pin as input
     digitalWrite(LED_BUILTIN, LOW);
+    
+    // Configure ADC resolution
+    analogReadResolution(12);  // Set ADC resolution to 12 bits
+    
+    // Configure ADC pins
+    pinMode(ADC_PIN1, INPUT);
+    pinMode(ADC_PIN2, INPUT);
     
     // Check if both buttons are pressed during startup to reset config
     if (digitalRead(BUTTON_DOWNSTAIRS) == HIGH && digitalRead(BUTTON_DOOR) == HIGH) {
-        DEBUG_PRINTLN("Both buttons pressed during startup - resetting to defaults");
+        MQTT_DEBUG_F("Both buttons pressed during startup - resetting to defaults");
         clearEEPROM();
         delay(1000); // Give some time to release buttons
     }
@@ -140,10 +209,27 @@ void setup() {
     
     // Initialize DFPlayer
     dfPlayerSerial.begin(9600, SERIAL_8N1, DFPLAYER_RX, DFPLAYER_TX);
-    setupDFPlayer();
+    delay(200);  // Give DFPlayer time to initialize
     
-    // Set initial volume to 0
-    dfPlayer.volume(0);
+    bool dfPlayerInitialized = false;
+    int retries = 3;
+    while (retries > 0 && !dfPlayerInitialized) {
+        if (dfPlayer.begin(dfPlayerSerial)) {
+            MQTT_DEBUG_F("DFPlayer initialized successfully");
+            dfPlayer.setTimeOut(500);
+            dfPlayer.volume(0);  // Start with volume at 0
+            dfPlayer.EQ(DFPLAYER_EQ_NORMAL);
+            dfPlayer.outputDevice(DFPLAYER_DEVICE_SD);
+            dfPlayerInitialized = true;
+            break;
+        }
+        MQTT_DEBUG_F("Failed to initialize DFPlayer, retrying...");
+        delay(1000);
+        retries--;
+    }
+    if (!dfPlayerInitialized) {
+        MQTT_DEBUG_F("Unable to begin DFPlayer after multiple attempts");
+    }
     
     // Setup WiFi and MQTT
     setupWiFi();
@@ -164,40 +250,46 @@ void setup() {
         } else {
             type = "filesystem";
         }
-        DEBUG_PRINTLN("Start updating " + type);
+        MQTT_DEBUG_F("Start updating %s", type);
     });
     
     ArduinoOTA.onEnd([]() {
-        DEBUG_PRINTLN("\nEnd");
+        MQTT_DEBUG_F("\nEnd");
     });
     
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        DEBUG_PRINTF("Progress: %u%%\r", (progress / (total / 100)));
+        // MQTT_DEBUG_F("Progress: %u%%\r", (progress / (total / 100)));
     });
     
     ArduinoOTA.onError([](ota_error_t error) {
-        DEBUG_PRINTF("Error[%u]: ", error);
-        if (error == OTA_AUTH_ERROR) DEBUG_PRINTLN("Auth Failed");
-        else if (error == OTA_BEGIN_ERROR) DEBUG_PRINTLN("Begin Failed");
-        else if (error == OTA_CONNECT_ERROR) DEBUG_PRINTLN("Connect Failed");
-        else if (error == OTA_RECEIVE_ERROR) DEBUG_PRINTLN("Receive Failed");
-        else if (error == OTA_END_ERROR) DEBUG_PRINTLN("End Failed");
+        MQTT_DEBUG_F("Error[%u]: ", error);
+        if (error == OTA_AUTH_ERROR) {
+            MQTT_DEBUG_F("Auth Failed");
+        } else if (error == OTA_BEGIN_ERROR) {
+            MQTT_DEBUG_F("Begin Failed");
+        } else if (error == OTA_CONNECT_ERROR) {
+            MQTT_DEBUG_F("Connect Failed");
+        } else if (error == OTA_RECEIVE_ERROR) {
+            MQTT_DEBUG_F("Receive Failed");
+        } else if (error == OTA_END_ERROR) {
+            MQTT_DEBUG_F("End Failed");
+        }
     });
     
     ArduinoOTA.begin();
-    DEBUG_PRINTLN("OTA initialized");
-    DEBUG_PRINTF("OTA available on IP: %s Port: 3232\n", WiFi.localIP().toString().c_str());
+    MQTT_DEBUG_F("OTA initialized");
+    MQTT_DEBUG_F("OTA available on IP: %s Port: 3232\n", WiFi.localIP().toString().c_str());
     
     // Try mDNS after OTA is set up
     if (WiFi.status() == WL_CONNECTED) {
         if (MDNS.begin("doorbell")) {
-            DEBUG_PRINTLN("mDNS responder started");
+            MQTT_DEBUG_F("mDNS responder started");
             MDNS.addService("arduino", "tcp", 3232); // Add service for OTA
         } else {
-            DEBUG_PRINTLN("Error setting up MDNS responder!");
+            MQTT_DEBUG_F("Error setting up MDNS responder!");
         }
     } else {
-        DEBUG_PRINTLN("WiFi not connected - skipping MDNS setup");
+        MQTT_DEBUG_F("WiFi not connected - skipping MDNS setup");
     }
     
     setupMQTT();
@@ -207,310 +299,145 @@ void setup() {
 }
 
 void loop() {
-    // Handle OTA updates
     ArduinoOTA.handle();
     
-    // Check WiFi connection
-    if (WiFi.status() != WL_CONNECTED) {
-        setupWiFi();
-    }
-    
-    // Handle MQTT connection
     if (!mqtt.connected()) {
         reconnect();
     }
     mqtt.loop();
+
+    currentTime = millis();  // Update current time
+
+    // Check if playback has finished
+    if (currentTime - lastPlaybackCheck >= 200) {  // Still keep the 200ms check interval
+        lastPlaybackCheck = currentTime;
+        
+        bool isBusy = digitalRead(DFPLAYER_BUSY);
+        
+        if (isBusy && isPlaying) {  // If HIGH (not busy) and was playing, playback has finished
+            MQTT_DEBUG_F("Playback finished (BUSY pin HIGH)");
+            isPlaying = false;
+            digitalWrite(LED_BUILTIN, LOW);  // Turn off LED
+            dfPlayer.volume(0);  // Reset volume after playback
+        }
+    }
     
     // Handle pending play requests
-    if (playRequest.pending) {
-        unsigned long currentTime = millis();
-        
-        // Check if we need to reset volume
-        if (isPlaying && (currentTime - volumeResetTimer >= config.volume_reset_ms)) {
-            dfPlayer.volume(0);
-            isPlaying = false;
-        }
+    if (playRequest.pending && !isPlaying) {
 
-        // Only play if not already playing or cooldown has passed
-        if (!isPlaying || (currentTime - lastPlayTime >= config.button_cooldown_ms)) {
             dfPlayer.volume(percentToVolume(playRequest.volume));
             dfPlayer.play(playRequest.track);
             lastPlayTime = currentTime;
             volumeResetTimer = currentTime;
             isPlaying = true;
-            mqtt.publish("doorbell/debug", "Playing queued track");
-        }
+            MQTT_DEBUG("Playing queued track");
         playRequest.pending = false;
     }
 
-    // Handle emergency LED if in emergency mode
-    if (emergencyMode) {
-        unsigned long currentMillis = millis();
-        
-        // Handle LED flashing
-        if (currentMillis - lastEmergencyLedToggle >= EMERGENCY_LED_INTERVAL) {
-            lastEmergencyLedToggle = currentMillis;
-            digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-        }
-        
-        // Check if emergency duration has elapsed
-        if (config.emergency_duration > 0 && 
-            (currentMillis - emergencyStartTime) >= (config.emergency_duration * 1000UL)) {
-            // Auto-disable emergency mode
-            emergencyMode = false;
-            dfPlayer.stop();
-            dfPlayer.volume(percentToVolume(config.door_volume)); // Reset to normal volume
-            digitalWrite(LED_BUILTIN, LOW);
-            mqtt.publish("doorbell/status", "{\"emergency\": false, \"message\": \"Emergency mode auto-disabled after timeout\"}");
-        }
-    }
+    // Check and handle buttons
+#ifdef INPUT_MODE_DIGITAL
+    checkButtons();
+#else
+    checkADC();
+#endif
 
-    // Handle LED for normal play (non-emergency)
-    if (normalLedOn && !emergencyMode) {
-        if (millis() - ledStartTime >= 5000) {  // 5 seconds passed
-            digitalWrite(LED_BUILTIN, LOW);  // Turn off LED
-            normalLedOn = false;
-        }
+    // Handle button actions
+    if (buttonStates[0].isValidPress) {  // Downstairs button
+        handleNormalDoorbell(0);
     }
-
-    // Check buttons only if not in emergency mode
-    if (!emergencyMode) {
-        unsigned long currentTime = millis();
-        
-        // Handle downstairs button
-        bool downstairsState = digitalRead(BUTTON_DOWNSTAIRS) == HIGH;
-        if (downstairsState && !buttonDownstairsWasPressed) {
-            // Button just pressed - record start time
-            buttonDownstairsPressStart = currentTime;
-            buttonDownstairsWasPressed = true;
-        } else if (downstairsState && buttonDownstairsWasPressed) {
-            // Button is still pressed - check duration
-            if (currentTime - buttonDownstairsPressStart >= BUTTON_PRESS_DURATION) {
-                handleButton(BUTTON_DOWNSTAIRS, false);
-                buttonDownstairsPressStart = currentTime;  // Reset start time to prevent multiple triggers
-            }
-        } else if (!downstairsState && buttonDownstairsWasPressed) {
-            // Button was released
-            buttonDownstairsWasPressed = false;
-        }
-        
-        // Handle door button
-        bool doorState = digitalRead(BUTTON_DOOR) == HIGH;
-        if (doorState && !buttonDoorWasPressed) {
-            // Button just pressed - record start time
-            buttonDoorPressStart = currentTime;
-            buttonDoorWasPressed = true;
-        } else if (doorState && buttonDoorWasPressed) {
-            // Button is still pressed - check duration
-            if (currentTime - buttonDoorPressStart >= BUTTON_PRESS_DURATION) {
-                handleButton(BUTTON_DOOR, false);
-                buttonDoorPressStart = currentTime;  // Reset start time to prevent multiple triggers
-            }
-        } else if (!doorState && buttonDoorWasPressed) {
-            // Button was released
-            buttonDoorWasPressed = false;
-        }
+    if (buttonStates[1].isValidPress) {  // Door button
+        handleNormalDoorbell(1);
     }
 }
 
 void setupWiFi() {
     delay(10);
-    DEBUG_PRINTLN("\n=== WiFi Setup ===");
+    MQTT_DEBUG_F("\n=== WiFi Setup ===");
     
     // Set WiFi mode explicitly
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();  // Disconnect from any previous connections
     delay(100);
     
-    DEBUG_PRINTF("Attempting to connect to primary WiFi SSID: %s\n", config.wifi_ssid);
+    MQTT_DEBUG_F("Attempting to connect to primary WiFi SSID: %s\n", config.wifi_ssid);
     WiFi.begin(config.wifi_ssid, config.wifi_password);
     
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) {
         delay(500);
-        DEBUG_PRINT(".");
+        MQTT_DEBUG_F(".");
         attempts++;
     }
     
     if (WiFi.status() != WL_CONNECTED && strlen(config.backup_wifi_ssid) > 0) {
-        DEBUG_PRINTLN("\nPrimary WiFi connection failed");
-        DEBUG_PRINTF("Attempting to connect to backup WiFi SSID: %s\n", config.backup_wifi_ssid);
+        MQTT_DEBUG_F("\nPrimary WiFi connection failed");
+        MQTT_DEBUG_F("Attempting to connect to backup WiFi SSID: %s\n", config.backup_wifi_ssid);
         WiFi.begin(config.backup_wifi_ssid, config.backup_wifi_password);
         attempts = 0;
         while (WiFi.status() != WL_CONNECTED && attempts < 20) {
             delay(500);
-            DEBUG_PRINT(".");
+            MQTT_DEBUG_F(".");
             attempts++;
         }
     }
     
     if (WiFi.status() == WL_CONNECTED) {
-        DEBUG_PRINTLN("\nWiFi connected successfully!");
-        DEBUG_PRINTF("Connected to SSID: %s\n", WiFi.SSID().c_str());
-        DEBUG_PRINTF("IP address: %s\n", WiFi.localIP().toString().c_str());
-        DEBUG_PRINTF("Signal strength (RSSI): %d dBm\n", WiFi.RSSI());
+        MQTT_DEBUG_F("\nWiFi connected successfully!");
+        MQTT_DEBUG_F("Connected to SSID: %s\n", WiFi.SSID().c_str());
+        MQTT_DEBUG_F("IP address: %s\n", WiFi.localIP().toString().c_str());
+        MQTT_DEBUG_F("Signal strength (RSSI): %d dBm\n", WiFi.RSSI());
         
         // Initialize MDNS
         bool mdnsStarted = MDNS.begin("doorbell");
         if (!mdnsStarted) {
-            DEBUG_PRINTLN("Error setting up MDNS responder!");
+            MQTT_DEBUG_F("Error setting up MDNS responder!");
         } else {
-            DEBUG_PRINTLN("mDNS responder started");
+            MQTT_DEBUG_F("mDNS responder started");
             MDNS.addService("arduino", "tcp", 3232); // Advertise OTA service
         }
     } else {
-        DEBUG_PRINTLN("\nFailed to connect to any WiFi network");
-        DEBUG_PRINTLN("Device will continue to work in offline mode");
+        MQTT_DEBUG_F("\nFailed to connect to any WiFi network");
+        MQTT_DEBUG_F("Device will continue to work in offline mode");
     }
-    DEBUG_PRINTLN("=================\n");
-}
-
-void setupOTA() {
-    ArduinoOTA.setHostname("doorbell");
-    ArduinoOTA.setPort(3232);  // Explicitly set port
-
-    
-    ArduinoOTA.onStart([]() {
-        String type;
-        if (ArduinoOTA.getCommand() == U_FLASH) {
-            type = "sketch";
-        } else {
-            type = "filesystem";
-        }
-        DEBUG_PRINTLN("Start updating " + type);
-    });
-    
-    ArduinoOTA.onEnd([]() {
-        DEBUG_PRINTLN("\nEnd");
-    });
-    
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        DEBUG_PRINTF("Progress: %u%%\r", (progress / (total / 100)));
-    });
-    
-    ArduinoOTA.onError([](ota_error_t error) {
-        DEBUG_PRINTF("Error[%u]: ", error);
-        if (error == OTA_AUTH_ERROR) DEBUG_PRINTLN("Auth Failed");
-        else if (error == OTA_BEGIN_ERROR) DEBUG_PRINTLN("Begin Failed");
-        else if (error == OTA_CONNECT_ERROR) DEBUG_PRINTLN("Connect Failed");
-        else if (error == OTA_RECEIVE_ERROR) DEBUG_PRINTLN("Receive Failed");
-        else if (error == OTA_END_ERROR) DEBUG_PRINTLN("End Failed");
-    });
-    
-    ArduinoOTA.begin();
-    DEBUG_PRINTLN("OTA initialized and ready for updates on port 3232");
+    MQTT_DEBUG_F("=================\n");
 }
 
 void setupMQTT() {
+    MQTT_DEBUG_F("\n=== MQTT Setup ===");
+    MQTT_DEBUG_F("Connecting to MQTT server: %s:%s\n", config.mqtt_server, config.mqtt_port);
     mqtt.setServer(config.mqtt_server, atoi(config.mqtt_port));
     mqtt.setCallback(callback);
 }
 
 void setupDFPlayer() {
-    if (!dfPlayer.begin(dfPlayerSerial)) {
-        Serial.println("Unable to begin DFPlayer");
-        // while(true);
-    }
-    dfPlayer.setTimeOut(500);
-    dfPlayer.volume(20);  // Set initial volume (0-30)
-    dfPlayer.EQ(DFPLAYER_EQ_NORMAL);
-    dfPlayer.outputDevice(DFPLAYER_DEVICE_SD);
-}
-
-void handleButton(int button, bool simulated) {
-    unsigned long currentTime = millis();
+    dfPlayerSerial.begin(9600, SERIAL_8N1, DFPLAYER_RX, DFPLAYER_TX);
+    delay(200);  // Give DFPlayer time to initialize
     
-    // Debounce check
-    if (currentTime - lastDebounceTime < debounceDelay) {
-        return;
-    }
-    lastDebounceTime = currentTime;
-
-    // Check if we need to reset volume
-    if (isPlaying && (currentTime - volumeResetTimer >= config.volume_reset_ms)) {
-        dfPlayer.volume(0);
-        isPlaying = false;
-    }
-
-    // Panic button detection logic
-    if (!emergencyMode && button == BUTTON_DOOR) {  // Only check door button for panic
-        if (pressCount == 0) {
-            // First press in a new sequence
-            firstPressTime = currentTime;
-            pressCount = 1;
-        } else {
-            // Check if we're still within the time window
-            if (currentTime - firstPressTime <= (config.panic_window * 1000UL)) {
-                pressCount++;
-                
-                // Check if we've reached panic threshold
-                if (pressCount >= config.panic_press_threshold) {
-                    // Trigger emergency mode
-                    emergencyMode = true;
-                    emergencyStartTime = currentTime;  // Start emergency timer
-                    dfPlayer.volume(percentToVolume(config.emergency_volume));
-                    dfPlayer.loop(config.emergency_track);
-                    digitalWrite(LED_BUILTIN, HIGH);
-                    
-                    // Publish emergency notification
-                    StaticJsonDocument<200> statusDoc;
-                    statusDoc["emergency"] = true;
-                    statusDoc["trigger"] = "panic_button";
-                    statusDoc["presses"] = pressCount;
-                    statusDoc["window_ms"] = currentTime - firstPressTime;
-                    
-                    char buffer[256];
-                    serializeJson(statusDoc, buffer);
-                    mqtt.publish("doorbell/status", buffer);
-                    
-                    pressCount = 0;
-                    return;
-                }
-            } else {
-                // Outside time window, reset counter
-                firstPressTime = currentTime;
-                pressCount = 1;
-            }
+    bool dfPlayerInitialized = false;
+    int retries = 3;
+    while (retries > 0 && !dfPlayerInitialized) {
+        if (dfPlayer.begin(dfPlayerSerial)) {
+            MQTT_DEBUG_F("DFPlayer initialized successfully");
+            dfPlayer.setTimeOut(500);
+            dfPlayer.volume(0);  // Start with volume at 0
+            dfPlayer.EQ(DFPLAYER_EQ_NORMAL);
+            dfPlayer.outputDevice(DFPLAYER_DEVICE_SD);
+            dfPlayerInitialized = true;
+            break;
         }
+        MQTT_DEBUG_F("Failed to initialize DFPlayer, retrying...");
+        delay(1000);
+        retries--;
     }
-
-    // Normal doorbell handling (only if not in emergency mode)
-    if (!emergencyMode) {
-        // Check if we're within cooldown period or if melody is already playing
-        if (isPlaying && (currentTime - lastPlayTime < config.button_cooldown_ms)) {
-            return;
-        }
-
-        if (button == BUTTON_DOWNSTAIRS) {
-            dfPlayer.volume(percentToVolume(config.downstairs_volume));
-            dfPlayer.play(config.downstairs_track);
-            mqtt.publish("doorbell/event", "downstairs");
-            lastPlayTime = currentTime;
-            volumeResetTimer = currentTime;
-            isPlaying = true;
-            // Turn on LED for 5 seconds
-            digitalWrite(LED_BUILTIN, HIGH);
-            ledStartTime = currentTime;
-            normalLedOn = true;
-        } else if (button == BUTTON_DOOR) {
-            dfPlayer.volume(percentToVolume(config.door_volume));
-            dfPlayer.play(config.door_track);
-            mqtt.publish("doorbell/event", "door");
-            lastPlayTime = currentTime;
-            volumeResetTimer = currentTime;
-            isPlaying = true;
-            // Turn on LED for 5 seconds
-            digitalWrite(LED_BUILTIN, HIGH);
-            ledStartTime = currentTime;
-            normalLedOn = true;
-        }
+    if (!dfPlayerInitialized) {
+        MQTT_DEBUG_F("Unable to begin DFPlayer after multiple attempts");
     }
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
     // Safety check for topic
     if (!topic || strlen(topic) < 2) {
-        mqtt.publish("doorbell/debug", "Error: Invalid topic received");
+        MQTT_DEBUG("Error: Invalid topic received");
         return;
     }
 
@@ -525,43 +452,42 @@ void callback(char* topic, byte* payload, unsigned int length) {
     message[length] = '\0';
     
     // Debug message
-    char debug_msg[512];
-    snprintf(debug_msg, sizeof(debug_msg), "Received on topic '%s': %s", topic_copy, message);
-    mqtt.publish("doorbell/debug", debug_msg);
+    MQTT_DEBUG_F("Received on topic '%s': %s", topic_copy, message);
     
     // Handle simulation commands (no JSON needed)
     if (strcmp(topic_copy, "doorbell/simulate/door") == 0) {
-        mqtt.publish("doorbell/debug", "Simulating door button press");
-        handleButton(BUTTON_DOOR, true);
+        MQTT_DEBUG("Simulating door button press");
+        handleSimulatedButton(BUTTON_DOOR);
         return;
     }
     else if (strcmp(topic_copy, "doorbell/simulate/downstairs") == 0) {
-        mqtt.publish("doorbell/debug", "Simulating downstairs button press");
-        handleButton(BUTTON_DOWNSTAIRS, true);
+        MQTT_DEBUG("Simulating downstairs button press");
+        handleSimulatedButton(BUTTON_DOWNSTAIRS);
         return;
     }
     else if (strcmp(topic_copy, "doorbell/system/reboot") == 0) {
         // Check if there's a confirmation payload
         if (strcmp(message, "REBOOT") == 0) {
-            mqtt.publish("doorbell/status", "{\"system\": \"reboot\", \"message\": \"Rebooting device...\"}");
+            MQTT_DEBUG("Rebooting device...");
             // Give MQTT time to send the message
             mqtt.loop();
             delay(100);
             ESP.restart();
         } else {
-            mqtt.publish("doorbell/status", "{\"system\": \"reboot\", \"message\": \"To reboot, send 'REBOOT' to doorbell/system/reboot\"}");
+            MQTT_DEBUG("To reboot, send 'REBOOT' to doorbell/system/reboot");
         }
         return;
     }
     
     // Handle get commands (no JSON needed)
     if (strcmp(topic_copy, "doorbell/get/config") == 0) {
-        mqtt.publish("doorbell/debug", "Getting config");
+        MQTT_DEBUG("Getting config");
         publishConfig();
         return;
     }
-    else if (strcmp(topic_copy, "doorbell/get/status") == 0) {
-        mqtt.publish("doorbell/debug", "Getting status");
+    else if (strcmp(topic_copy, "doorbell/get/all") == 0) {
+        MQTT_DEBUG("Getting all settings");
+        publishConfig();
         publishDeviceStatus();
         return;
     }
@@ -572,9 +498,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
         int track = atoi(track_str);
         char debug_msg[64];
         snprintf(debug_msg, sizeof(debug_msg), "Received play command for track %d", track);
-        mqtt.publish("doorbell/debug", debug_msg);
+        MQTT_DEBUG(debug_msg);
         if (track > 0) {
-            mqtt.publish("doorbell/debug", "Queueing track to play");
+            MQTT_DEBUG("Queueing track to play");
             playRequest.pending = true;
             playRequest.track = track;
             playRequest.volume = 100; // max volume in percentage
@@ -582,78 +508,58 @@ void callback(char* topic, byte* payload, unsigned int length) {
         return;
     }
     
-    // Handle emergency mode toggle
-    if (strcmp(topic_copy, "doorbell/emergency") == 0) {
-        if (strcmp(message, "ON") == 0 && !emergencyMode) {
-            emergencyMode = true;
-            emergencyStartTime = millis();  // Start emergency timer
-            dfPlayer.volume(percentToVolume(config.emergency_volume));
-            dfPlayer.loop(config.emergency_track);
-            digitalWrite(LED_BUILTIN, HIGH);
-            mqtt.publish("doorbell/status", "{\"emergency\": true, \"message\": \"Emergency mode activated\"}");
-        }
-        else if (strcmp(message, "OFF") == 0 && emergencyMode) {
-            emergencyMode = false;
-            dfPlayer.stop();
-            dfPlayer.volume(percentToVolume(config.door_volume)); // Reset to normal volume
-            digitalWrite(LED_BUILTIN, LOW);
-            mqtt.publish("doorbell/status", "{\"emergency\": false, \"message\": \"Emergency mode deactivated\"}");
-        }
-        return;
-    }
-    
     // All remaining commands require JSON
     if (strncmp(topic_copy, "doorbell/set/", 12) != 0) {
-        mqtt.publish("doorbell/debug", "Error: Unknown command");
+        MQTT_DEBUG("Error: Unknown command");
         return;
     }
     
     // Parse JSON for set commands
-    StaticJsonDocument<200> doc;
+    DynamicJsonDocument doc(200);
     DeserializationError error = deserializeJson(doc, message);
     
     if (error) {
         char error_msg[64];
         snprintf(error_msg, sizeof(error_msg), "Failed to parse JSON for set command: %s", error.c_str());
-        mqtt.publish("doorbell/debug", error_msg);
+        MQTT_DEBUG(error_msg);
         return;
     }
     
     // Handle set commands (all require JSON)
     if (strcmp(topic_copy, "doorbell/set/button/downstairs") == 0) {
-        mqtt.publish("doorbell/debug", "Setting downstairs button config");
+        MQTT_DEBUG("Setting downstairs button config");
         if (doc.containsKey("track")) {
             config.downstairs_track = doc["track"];
             char debug_msg[64];
             snprintf(debug_msg, sizeof(debug_msg), "Set downstairs track to %d", config.downstairs_track);
-            mqtt.publish("doorbell/debug", debug_msg);
+            MQTT_DEBUG(debug_msg);
         }
         if (doc.containsKey("volume")) {
             config.downstairs_volume = doc["volume"];
             char debug_msg[64];
             snprintf(debug_msg, sizeof(debug_msg), "Set downstairs volume to %d%%", config.downstairs_volume);
-            mqtt.publish("doorbell/debug", debug_msg);
+            MQTT_DEBUG(debug_msg);
         }
         saveConfig();
     }
     else if (strcmp(topic_copy, "doorbell/set/button/door") == 0) {
-        mqtt.publish("doorbell/debug", "Setting door button config");
+        MQTT_DEBUG("Setting door button config");
         if (doc.containsKey("track")) {
             config.door_track = doc["track"];
             char debug_msg[64];
             snprintf(debug_msg, sizeof(debug_msg), "Set door track to %d", config.door_track);
-            mqtt.publish("doorbell/debug", debug_msg);
+            MQTT_DEBUG(debug_msg);
         }
         if (doc.containsKey("volume")) {
             config.door_volume = doc["volume"];
             char debug_msg[64];
             snprintf(debug_msg, sizeof(debug_msg), "Set door volume to %d%%", config.door_volume);
-            mqtt.publish("doorbell/debug", debug_msg);
+            MQTT_DEBUG(debug_msg);
         }
         saveConfig();
     }
     else if (strcmp(topic_copy, "doorbell/set/config") == 0) {
-        mqtt.publish("doorbell/debug", "Setting device config");
+        MQTT_DEBUG("Setting device config");
         // Update WiFi settings
         if (doc.containsKey("wifi_ssid")) {
             strlcpy(config.wifi_ssid, doc["wifi_ssid"], sizeof(config.wifi_ssid));
@@ -681,39 +587,20 @@ void callback(char* topic, byte* payload, unsigned int length) {
         if (doc.containsKey("backup_mqtt_port")) {
             strlcpy(config.backup_mqtt_port, doc["backup_mqtt_port"], sizeof(config.backup_mqtt_port));
         }
+        
+        // Update debug setting
+        if (doc.containsKey("debug_enabled")) {
+            config.debug_enabled = doc["debug_enabled"].as<bool>();
+            MQTT_DEBUG_F("Debug mode %s", config.debug_enabled ? "enabled" : "disabled");
+        }
+        
         saveConfig();
-    }
-    else if (strcmp(topic_copy, "doorbell/set/emergency") == 0) {
-        mqtt.publish("doorbell/debug", "Setting emergency config");
-        if (doc.containsKey("track")) {
-            config.emergency_track = doc["track"];
-        }
-        if (doc.containsKey("volume")) {
-            config.emergency_volume = doc["volume"];
-        }
-        if (doc.containsKey("duration")) {
-            config.emergency_duration = doc["duration"];
-        }
-        if (doc.containsKey("panic_threshold")) {
-            config.panic_press_threshold = doc["panic_threshold"];
-        }
-        if (doc.containsKey("panic_window")) {
-            config.panic_window = doc["panic_window"];
-        }
-        if (doc.containsKey("button_cooldown_ms")) {
-            config.button_cooldown_ms = doc["button_cooldown_ms"];
-        }
-        if (doc.containsKey("volume_reset_ms")) {
-            config.volume_reset_ms = doc["volume_reset_ms"];
-        }
-        saveConfig();
-        publishConfig();
     }
 }
 
 void reconnect() {
     while (!mqtt.connected()) {
-        DEBUG_PRINTLN("Attempting MQTT connection...");
+        MQTT_DEBUG_F("Attempting MQTT connection...");
         
         // Create a random client ID
         String clientId = "DoorBell-";
@@ -721,7 +608,7 @@ void reconnect() {
         
         // Attempt to connect
         if (mqtt.connect(clientId.c_str(), config.mqtt_user, config.mqtt_password)) {
-            DEBUG_PRINTLN("Connected to MQTT");
+            MQTT_DEBUG_F("Connected to MQTT");
             
             // Subscribe to all set commands (require JSON)
             mqtt.subscribe("doorbell/set/#");
@@ -731,17 +618,11 @@ void reconnect() {
             mqtt.subscribe("doorbell/simulate/#");
             // Subscribe to play commands (no JSON)
             mqtt.subscribe("doorbell/play/#");
-            // Subscribe to emergency toggle
-            mqtt.subscribe("doorbell/emergency");
             // Subscribe to system commands
             mqtt.subscribe("doorbell/system/#");
             
             publishDeviceStatus();
-        } else {
-            DEBUG_PRINT("Failed to connect to MQTT, rc=");
-            DEBUG_PRINTLN(mqtt.state());
-            DEBUG_PRINTLN("Trying backup MQTT server...");
-            
+        } else {                
             // Try backup MQTT server if configured
             if (strlen(config.backup_mqtt_server) > 0) {
                 mqtt.setServer(config.backup_mqtt_server, atoi(config.backup_mqtt_port));
@@ -767,14 +648,10 @@ void loadConfig() {
         config.downstairs_volume = 50; // Default volume in percentage
         config.door_volume = 50;       // Default volume in percentage
         
-        // Default emergency settings
-        config.emergency_track = 99;
-        config.emergency_volume = 100; // Default volume in percentage
-        config.emergency_duration = 60;    // 1 minute default
-        config.panic_press_threshold = 5;  // 5 presses
-        config.panic_window = 20;         // 20 seconds window
         config.button_cooldown_ms = 15000; // 15 seconds default
         config.volume_reset_ms = 60000;   // 1 minute default
+        
+        config.debug_enabled = false; // Default debug mode
         
         saveConfig();
     }
@@ -787,44 +664,52 @@ void saveConfig() {
 }
 
 void publishConfig() {
-    StaticJsonDocument<512> configObj;
+    DynamicJsonDocument configObj(512);
     
-    // WiFi settings
+    // WiFi settings (mask passwords)
     configObj["wifi_ssid"] = config.wifi_ssid;
+    configObj["wifi_password"] = "********";
     configObj["backup_wifi_ssid"] = config.backup_wifi_ssid;
+    configObj["backup_wifi_password"] = "********";
     
-    // MQTT settings
+    // MQTT settings (mask password)
     configObj["mqtt_server"] = config.mqtt_server;
     configObj["mqtt_port"] = config.mqtt_port;
     configObj["backup_mqtt_server"] = config.backup_mqtt_server;
     configObj["backup_mqtt_port"] = config.backup_mqtt_port;
+    configObj["mqtt_user"] = config.mqtt_user;
+    configObj["mqtt_password"] = "********";
     
-    // Button settings
-    configObj["downstairs_track"] = config.downstairs_track;
-    configObj["door_track"] = config.door_track;
-    configObj["downstairs_volume"] = config.downstairs_volume;
-    configObj["door_volume"] = config.door_volume;
+    // Button configurations
+    JsonObject downstairsConfig = configObj.createNestedObject("downstairs");
+    downstairsConfig["track"] = config.downstairs_track;
+    downstairsConfig["volume"] = config.downstairs_volume;
     
-    // Emergency settings
-    configObj["emergency_track"] = config.emergency_track;
-    configObj["emergency_volume"] = config.emergency_volume;
-    configObj["emergency_duration"] = config.emergency_duration;
-    configObj["panic_press_threshold"] = config.panic_press_threshold;
-    configObj["panic_window"] = config.panic_window;
-    configObj["button_cooldown_ms"] = config.button_cooldown_ms;
-    configObj["volume_reset_ms"] = config.volume_reset_ms;
+    JsonObject doorConfig = configObj.createNestedObject("door");
+    doorConfig["track"] = config.door_track;
+    doorConfig["volume"] = config.door_volume;
+    
+    // Timing configurations
+    JsonObject timingConfig = configObj.createNestedObject("timing");
+    timingConfig["button_cooldown_ms"] = config.button_cooldown_ms;
+    timingConfig["volume_reset_ms"] = config.volume_reset_ms;
+    
+    // Debug configuration
+    configObj["debug_enabled"] = config.debug_enabled;
     
     char buffer[512];
-    serializeJson(configObj, buffer);
+    ArduinoJson::serializeJson(configObj, buffer);
+    
+    MQTT_DEBUG("Published config");
 }
 
 void clearEEPROM() {
-    DEBUG_PRINTLN("Clearing EEPROM...");
+    MQTT_DEBUG_F("Clearing EEPROM...");
     for (int i = 0; i < EEPROM_SIZE; i++) {
         EEPROM.write(i, 0);
     }
     EEPROM.commit();
-    DEBUG_PRINTLN("EEPROM cleared!");
+    MQTT_DEBUG_F("EEPROM cleared!");
 }
 
 void publishDeviceStatus() {
@@ -833,7 +718,7 @@ void publishDeviceStatus() {
     }
     
     // Create a JSON document for device status
-    StaticJsonDocument<512> statusDoc;
+    DynamicJsonDocument statusDoc(512);
     
     // Device information
     statusDoc["status"] = "online";
@@ -853,13 +738,230 @@ void publishDeviceStatus() {
     configObj["downstairs_volume"] = config.downstairs_volume;
     configObj["door_volume"] = config.door_volume;
     
-    // Emergency mode status
-    statusDoc["emergency"] = emergencyMode;
-    
     char buffer[512];
-    serializeJson(statusDoc, buffer);
+    ArduinoJson::serializeJson(statusDoc, buffer);
     
     // Publish to status topic
     mqtt.publish("doorbell/status", buffer, true);  // retain flag set to true
-    DEBUG_PRINTLN("Published device status");
+    MQTT_DEBUG("Published device status");
+}
+
+// Function to handle normal doorbell operation
+void handleNormalDoorbell(int buttonIndex) {
+    // Check if we're within cooldown period or if melody is already playing
+    if (isPlaying || (currentTime - lastPlayTime < config.button_cooldown_ms)) {
+        return;
+    }
+
+    if (buttonIndex == 0) {  // DOWNSTAIRS
+        dfPlayer.volume(percentToVolume(config.downstairs_volume));
+        dfPlayer.play(config.downstairs_track);
+        MQTT_DEBUG("downstairs");
+    } else {  // DOOR
+        dfPlayer.volume(percentToVolume(config.door_volume));
+        dfPlayer.play(config.door_track);
+        MQTT_DEBUG("door");
+    }
+    delay(500);
+    
+    lastPlayTime = currentTime;
+    volumeResetTimer = currentTime;
+    isPlaying = true;
+    digitalWrite(LED_BUILTIN, HIGH);
+    // ledStartTime = currentTime;
+    // normalLedOn = true;
+}
+
+// Function to handle simulated button presses from MQTT
+void handleSimulatedButton(int button) {
+    MQTT_DEBUG_F(button == BUTTON_DOOR ? "Simulating door button" : "Simulating downstairs button");
+    handleNormalDoorbell(button == BUTTON_DOOR ? 1 : 0);
+}
+
+#ifdef INPUT_MODE_ANALOG
+// Function to analyze the completed session and determine which button was pressed
+void analyzeSession(ADCSession& session) {
+    if (session.numReadings == 0) {
+        DEBUG_PRINTLN("Session has no readings, skipping analysis");
+        return;
+    }
+    
+    unsigned long sessionDuration = session.endTime - session.startTime;
+    if (sessionDuration < MIN_SESSION_DURATION) {
+        DEBUG_PRINTF("Session too short: %lu ms (minimum: %d ms)\n", sessionDuration, MIN_SESSION_DURATION);
+        return;
+    }
+    
+    // The button type was already determined at session start
+    if (session.buttonDetected == 1) {
+        DEBUG_PRINTLN("Triggering DOOR button (determined at session start)");
+        handleSimulatedButton(BUTTON_DOOR);
+    } else if (session.buttonDetected == 0) {
+        DEBUG_PRINTLN("Triggering DOWNSTAIRS button (determined at session start)");
+        handleSimulatedButton(BUTTON_DOWNSTAIRS);
+    } else {
+        DEBUG_PRINTLN("No button was detected at session start, ignoring");
+    }
+    
+    // Create JSON array of all readings
+    DynamicJsonDocument doc(16384); // Adjust size based on MAX_SESSION_SAMPLES
+    doc["status"] = "ended";
+    doc["duration"] = sessionDuration;
+    doc["max_voltage"] = session.maxVoltage;
+    doc["button"] = session.buttonDetected;
+    doc["num_readings"] = session.numReadings;
+    
+    JsonArray readings = doc.createNestedArray("readings");
+    for (int i = 0; i < session.numReadings; i++) {
+        JsonObject reading = readings.createNestedObject();
+        reading["v1"] = session.readings[i].voltage1;
+        reading["v2"] = session.readings[i].voltage2;
+        reading["delta"] = session.readings[i].delta;
+        reading["graph"] = session.readings[i].graph;
+    }
+    
+    String output;
+    ArduinoJson::serializeJson(doc, output);
+    MQTT_DEBUG_F("Session data: %s", output.c_str());
+}
+#endif
+
+// Function to read and process ADC values
+void checkADC() {
+#ifdef INPUT_MODE_ANALOG
+    static unsigned long lastAdcRead = 0;
+    static unsigned long lastDebugPrint = 0;
+    currentTime = millis();
+    
+    if (currentTime - lastAdcRead >= ADC_SAMPLE_INTERVAL) {
+        lastAdcRead = currentTime;
+        
+        // Read ADC values (12-bit resolution: 0-4095)
+        int adc1_value = analogRead(ADC_PIN1);
+        int adc2_value = analogRead(ADC_PIN2);
+        
+        // Convert to voltage (3.3V max)
+        float voltage1 = (adc1_value * 3.3) / 4095.0;
+        float voltage2 = (adc2_value * 3.3) / 4095.0;
+        
+        // Print debug info every 1 second when not in a session
+        if (!currentSession.isActive && currentTime - lastDebugPrint >= 1000) {
+            DEBUG_PRINTF("ADC Values - ADC1: %d (%.2fV), ADC2: %d (%.2fV)\n", 
+                        adc1_value, voltage1, adc2_value, voltage2);
+            lastDebugPrint = currentTime;
+        }
+        
+        // Check if we need to start a new session (using threshold)
+        if ((voltage1 >= ADC_THRESHOLD || voltage2 >= ADC_THRESHOLD) && !currentSession.isActive && !isPlaying) {
+            DEBUG_PRINTF("Starting new session - ADC1: %.2fV, ADC2: %.2fV\n", voltage1, voltage2);
+            currentSession.startTime = currentTime;
+            currentSession.isActive = true;
+            currentSession.maxVoltage = max(voltage1, voltage2);
+            currentSession.numReadings = 0;
+            
+            // Determine button type based on which ADC started the session with >3V
+            if (voltage2 >= ADC_THRESHOLD) {
+                currentSession.buttonDetected = 1; // DOOR takes priority if ADC2 is high
+                DEBUG_PRINTLN("Session started by DOOR button (ADC2)");
+            } else if (voltage1 >= ADC_THRESHOLD) {
+                currentSession.buttonDetected = 0; // DOWNSTAIRS only if ADC2 was not high
+                DEBUG_PRINTLN("Session started by DOWNSTAIRS button (ADC1)");
+            }
+            
+            MQTT_DEBUG("Session started");
+        }
+        
+        // Update session data if active
+        if (currentSession.isActive) {
+            if (currentSession.numReadings >= MAX_SESSION_SAMPLES) {
+                DEBUG_PRINTLN("Session buffer full, ending session");
+                currentSession.isActive = false;
+                return;
+            }
+            
+            currentSession.maxVoltage = max(currentSession.maxVoltage, max(voltage1, voltage2));
+            
+            // Create new reading
+            ADCReading& reading = currentSession.readings[currentSession.numReadings];
+            reading.voltage1 = voltage1;
+            reading.voltage2 = voltage2;
+            reading.delta = currentTime - currentSession.startTime;
+            
+            // Create bar graphs with different characters for each voltage
+            char* graph = reading.graph;
+            int v1_bars = (int)((voltage1 * 20) / 3.3); // Scale to 20 characters max
+            int v2_bars = (int)((voltage2 * 20) / 3.3);
+            
+            for(int i = 0; i < 20; i++) {
+                graph[i] = (i < v1_bars) ? '#' : '.';      // First voltage uses #
+                graph[i+21] = (i < v2_bars) ? '*' : '.';   // Second voltage uses *
+            }
+            graph[20] = ' '; // separator
+            graph[41] = '\0';
+            
+            currentSession.numReadings++;
+            
+            // Print debug info every 100ms during session
+            if (currentTime - lastDebugPrint >= 100) {
+                DEBUG_PRINTF("Session ongoing - Readings: %d, ADC1: %.2fV, ADC2: %.2fV\n", 
+                            currentSession.numReadings, voltage1, voltage2);
+                lastDebugPrint = currentTime;
+            }
+            
+            // Publish current reading for debug
+            if (config.debug_enabled) {
+                char msg[256];
+                snprintf(msg, sizeof(msg), 
+                        "{\"adc1_v\":%.2f,\"adc2_v\":%.2f,\"delta\":%lu,\"graph\":\"\033[38;5;46m%.*s\033[0m \033[38;5;220m%s\033[0m\"}", 
+                        voltage1, voltage2, reading.delta, 20, graph, graph + 21);
+                MQTT_DEBUG(msg);
+            }
+            
+            // If voltage drops below threshold minus hysteresis OR minimum session duration met, end session
+            if ((voltage1 < (ADC_THRESHOLD - ADC_HYSTERESIS) && voltage2 < (ADC_THRESHOLD - ADC_HYSTERESIS))) {
+                // Check if this is just a temporary dropout
+                if (currentTime - lastValidVoltage <= ADC_DROPOUT_TOLERANCE) {
+                    // This is within our tolerance window, keep the session going
+                    DEBUG_PRINTF("Voltage dropout detected but within tolerance window (%lu ms)\n", 
+                               currentTime - lastValidVoltage);
+                } else {
+                    // Voltage has been low for too long, end the session
+                    DEBUG_PRINTF("Ending session - Final voltages ADC1: %.2fV, ADC2: %.2fV\n", voltage1, voltage2);
+                    currentSession.endTime = currentTime;
+                    
+                    // Only analyze if session meets minimum duration
+                    if (currentSession.endTime - currentSession.startTime >= MIN_SESSION_DURATION) {
+                        // Analyze the completed session
+                        analyzeSession(currentSession);
+                    } else {
+                        DEBUG_PRINTF("Session too short (%lu ms), ignoring\n", 
+                                   currentSession.endTime - currentSession.startTime);
+                    }
+                    
+                    // Reset session
+                    currentSession.isActive = false;
+                    currentSession.maxVoltage = 0.0;
+                    currentSession.buttonDetected = -1;
+                    currentSession.numReadings = 0;
+                }
+            } else if (currentTime - currentSession.startTime >= MIN_SESSION_DURATION) {
+                // Session has met minimum duration, end it
+                DEBUG_PRINTF("Session reached minimum duration (%d ms), ending\n", MIN_SESSION_DURATION);
+                currentSession.endTime = currentTime;
+                analyzeSession(currentSession);
+                
+                // Reset session
+                currentSession.isActive = false;
+                currentSession.maxVoltage = 0.0;
+                currentSession.buttonDetected = -1;
+                currentSession.numReadings = 0;
+            } else {
+                // Update lastValidVoltage timestamp since we have good readings
+                if (voltage1 >= ADC_THRESHOLD || voltage2 >= ADC_THRESHOLD) {
+                    lastValidVoltage = currentTime;
+                }
+            }
+        }
+    }
+#endif
 }

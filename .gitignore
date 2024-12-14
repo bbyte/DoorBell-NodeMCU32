@@ -6,3 +6,6 @@
 
 # Configuration files
 src/config.h
+
+# Session logs
+sessions/
