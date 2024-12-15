@@ -66,6 +66,70 @@ Note: The analog detection algorithm may need adjustment for different building 
   ```bash
   mosquitto_pub -t "doorbell/get/config" -m ""
   ```
+  Response:
+  ```json
+  {
+    "wifi_ssid": "MyWiFi",
+    "wifi_password": "********",
+    "backup_wifi_ssid": "BackupWiFi",
+    "backup_wifi_password": "********",
+    "mqtt_server": "192.168.1.10",
+    "mqtt_port": "1883",
+    "backup_mqtt_server": "backup.mqtt.server",
+    "backup_mqtt_port": "1883",
+    "mqtt_user": "user",
+    "mqtt_password": "********",
+    "downstairs": {
+      "track": 1,
+      "volume": 50
+    },
+    "door": {
+      "track": 2,
+      "volume": 50
+    },
+    "timing": {
+      "button_cooldown_ms": 15000,
+      "volume_reset_ms": 60000
+    },
+    "debug_enabled": false
+  }
+  ```
+
+- `doorbell/set/config` - Update device configuration
+  ```json
+  {
+    "wifi_ssid": "YourWiFi",
+    "wifi_password": "YourPassword",
+    "backup_wifi_ssid": "BackupWiFi",
+    "backup_wifi_password": "BackupPassword",
+    "mqtt_server": "mqtt.local",
+    "mqtt_port": "1883",
+    "backup_mqtt_server": "backup.mqtt.local",
+    "backup_mqtt_port": "1883",
+    "mqtt_user": "your_username",
+    "mqtt_password": "your_password",
+    "downstairs": {
+      "track": 1,
+      "volume": 50
+    },
+    "door": {
+      "track": 2,
+      "volume": 50
+    },
+    "timing": {
+      "button_cooldown_ms": 15000,
+      "volume_reset_ms": 60000
+    },
+    "debug_enabled": false
+  }
+  ```
+
+- `doorbell/get/all` - Get all settings (includes both config and status)
+  - No payload required
+  ```bash
+  mosquitto_pub -t "doorbell/get/all" -m ""
+  ```
+
 - `doorbell/get/status` - Request current device status
   - No payload required
   ```bash
@@ -142,19 +206,34 @@ Note: The analog detection algorithm may need adjustment for different building 
 - `doorbell/status` - Device status updates
   ```json
   {
-    "system": "reboot",
-    "message": "Rebooting device..."
+    "status": "online",
+    "ip": "192.168.1.100",
+    "rssi": -65,
+    "wifi_ssid": "MyWiFi",
+    "hostname": "doorbell",
+    "mqtt_server": "192.168.1.10",
+    "mqtt_port": 1883,
+    "config": {
+      "downstairs_track": 1,
+      "door_track": 2,
+      "downstairs_volume": 50,
+      "door_volume": 50
+    }
   }
   ```
+
+- `doorbell/event` - Button press events
   ```json
   {
-    "emergency": true,
-    "message": "Emergency mode activated"
+    "type": "button_press",
+    "button": "downstairs",  // or "door"
+    "track": 1,
+    "volume": 50
   }
   ```
 
 - `doorbell/debug` - Debug messages from the device
-  - Contains various operational messages and command confirmations
+  - Contains various operational messages, voltage readings, and command confirmations
 
 - `doorbell/timer/status` - Timer status updates
   ```json

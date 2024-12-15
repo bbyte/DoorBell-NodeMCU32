@@ -349,19 +349,24 @@ void loop() {
             isPlaying = false;
             digitalWrite(LED_BUILTIN, LOW);  // Turn off LED
             dfPlayer.volume(0);  // Reset volume after playback
+            MQTT_DEBUG("Ready for next playback");
         }
     }
     
     // Handle pending play requests
     if (playRequest.pending && !isPlaying) {
-
-            dfPlayer.volume(percentToVolume(playRequest.volume));
-            dfPlayer.play(playRequest.track);
-            lastPlayTime = currentTime;
-            volumeResetTimer = currentTime;
-            isPlaying = true;
-            MQTT_DEBUG("Playing queued track");
+        MQTT_DEBUG_F("Starting playback - Track: %d, Volume: %d%%", playRequest.track, playRequest.volume);
+        dfPlayer.volume(percentToVolume(playRequest.volume));
+        MQTT_DEBUG("Volume set");
+        dfPlayer.play(playRequest.track);
+        MQTT_DEBUG("Track played");
+        delay(500);
+        lastPlayTime = currentTime;
+        volumeResetTimer = currentTime;
+        isPlaying = true;
+        digitalWrite(LED_BUILTIN, HIGH);
         playRequest.pending = false;
+        MQTT_DEBUG("Playback started");
     }
 
     // Check and handle buttons
@@ -483,23 +488,33 @@ void callback(char* topic, byte* payload, unsigned int length) {
     
     // Debug message
     MQTT_DEBUG_F("Received on topic '%s': %s", topic_copy, message);
-    
-    // Handle simulation commands (no JSON needed)
-    if (strcmp(topic_copy, "doorbell/simulate/door") == 0) {
-        MQTT_DEBUG("Simulating door button press");
-        handleSimulatedButton(BUTTON_DOOR);
-        return;
-    }
-    else if (strcmp(topic_copy, "doorbell/simulate/downstairs") == 0) {
-        MQTT_DEBUG("Simulating downstairs button press");
-        handleSimulatedButton(BUTTON_DOWNSTAIRS);
-        return;
-    }
-    else if (strcmp(topic_copy, "doorbell/system/reboot") == 0) {
-        // Check if there's a confirmation payload
+
+    // List of commands that don't require JSON payload
+    const char* noJsonCommands[] = {
+        "doorbell/simulate/door",
+        "doorbell/simulate/downstairs",
+        "doorbell/get/config",
+        "doorbell/get/all",
+        "doorbell/timer/stop"
+    };
+    const int noJsonCommandsCount = sizeof(noJsonCommands) / sizeof(noJsonCommands[0]);
+
+    // List of commands that require JSON payload
+    const char* jsonCommands[] = {
+        "doorbell/set/button/downstairs",
+        "doorbell/set/button/door",
+        "doorbell/set/config",
+        "doorbell/timer/set"
+    };
+    const int jsonCommandsCount = sizeof(jsonCommands) / sizeof(jsonCommands[0]);
+
+    bool isCommand = false;
+
+    // Check for special commands first (reboot and play)
+    if (strcmp(topic_copy, "doorbell/system/reboot") == 0) {
+        isCommand = true;
         if (strcmp(message, "REBOOT") == 0) {
             MQTT_DEBUG("Rebooting device...");
-            // Give MQTT time to send the message
             mqtt.loop();
             delay(100);
             ESP.restart();
@@ -509,21 +524,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
         return;
     }
     
-    // Handle get commands (no JSON needed)
-    if (strcmp(topic_copy, "doorbell/get/config") == 0) {
-        MQTT_DEBUG("Getting config");
-        publishConfig();
-        return;
-    }
-    else if (strcmp(topic_copy, "doorbell/get/all") == 0) {
-        MQTT_DEBUG("Getting all settings");
-        publishConfig();
-        publishDeviceStatus();
-        return;
-    }
-    
-    // Handle play command (no JSON needed)
+    // Handle play command (special format)
     if (strncmp(topic_copy, "doorbell/play/", 14) == 0) {
+        isCommand = true;
         const char* track_str = topic_copy + 14;
         int track = atoi(track_str);
         char debug_msg[64];
@@ -537,150 +540,172 @@ void callback(char* topic, byte* payload, unsigned int length) {
         }
         return;
     }
-    
-    // Handle timer commands
-    else if (strcmp(topic_copy, "doorbell/timer/stop") == 0) {
-        if (timer.active) {
-            timer.active = false;
-            mqtt.publish("doorbell/timer/status", "{\"status\":\"stopped\"}");
-            MQTT_DEBUG("Timer stopped");
-        } else {
-            mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"No active timer\"}");
-            MQTT_DEBUG("Error: No active timer to stop");
-        }
-        return;
-    }
-    else if (strcmp(topic_copy, "doorbell/timer/set") == 0) {
-        DynamicJsonDocument timerDoc(200);
-        DeserializationError error = deserializeJson(timerDoc, message);
-        
-        if (error) {
-            mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
-            MQTT_DEBUG("Failed to parse timer JSON");
+
+    // Check if command is in no-JSON list
+    for (int i = 0; i < noJsonCommandsCount; i++) {
+        if (strcmp(topic_copy, noJsonCommands[i]) == 0) {
+            isCommand = true;
+            // Handle no-JSON commands
+            if (strcmp(noJsonCommands[i], "doorbell/simulate/door") == 0) {
+                MQTT_DEBUG("Simulating door button press");
+                handleSimulatedButton(BUTTON_DOOR);
+            }
+            else if (strcmp(noJsonCommands[i], "doorbell/simulate/downstairs") == 0) {
+                MQTT_DEBUG("Simulating downstairs button press");
+                handleSimulatedButton(BUTTON_DOWNSTAIRS);
+            }
+            else if (strcmp(noJsonCommands[i], "doorbell/get/config") == 0) {
+                MQTT_DEBUG("Getting config");
+                publishConfig();
+            }
+            else if (strcmp(noJsonCommands[i], "doorbell/get/all") == 0) {
+                MQTT_DEBUG("Getting all settings");
+                publishConfig();
+                publishDeviceStatus();
+            }
+            else if (strcmp(noJsonCommands[i], "doorbell/timer/stop") == 0) {
+                if (timer.active) {
+                    timer.active = false;
+                    mqtt.publish("doorbell/timer/status", "{\"status\":\"stopped\"}");
+                    MQTT_DEBUG("Timer stopped");
+                } else {
+                    mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"No active timer\"}");
+                    MQTT_DEBUG("Error: No active timer to stop");
+                }
+            }
             return;
         }
+    }
 
-        if (timer.active) {
-            mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"Timer already active\"}");
-            MQTT_DEBUG("Error: Timer already active");
+    // Check if command is in JSON list
+    for (int i = 0; i < jsonCommandsCount; i++) {
+        if (strcmp(topic_copy, jsonCommands[i]) == 0) {
+            isCommand = true;
+            
+            // Parse JSON for commands that require it
+            DynamicJsonDocument doc(200);
+            DeserializationError error = deserializeJson(doc, message);
+            
+            if (error) {
+                char error_msg[64];
+                snprintf(error_msg, sizeof(error_msg), "Failed to parse JSON: %s", error.c_str());
+                MQTT_DEBUG(error_msg);
+                return;
+            }
+
+            // Handle JSON commands
+            if (strcmp(topic_copy, "doorbell/timer/set") == 0) {
+                if (timer.active) {
+                    mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"Timer already active\"}");
+                    MQTT_DEBUG("Error: Timer already active");
+                    return;
+                }
+
+                if (!doc.containsKey("seconds") || !doc.containsKey("track") || !doc.containsKey("volume")) {
+                    mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"Missing required fields\"}");
+                    MQTT_DEBUG("Error: Missing required timer fields");
+                    return;
+                }
+
+                int seconds = doc["seconds"].as<int>();
+                if (seconds <= 0) {
+                    mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"Invalid duration\"}");
+                    MQTT_DEBUG("Error: Invalid timer duration");
+                    return;
+                }
+
+                timer.active = true;
+                timer.startTime = millis();
+                timer.durationMs = (unsigned long)seconds * 1000;
+                timer.track = doc["track"].as<int>();
+                timer.volume = doc["volume"].as<int>();
+
+                char statusMsg[128];
+                snprintf(statusMsg, sizeof(statusMsg), 
+                        "{\"status\":\"started\",\"seconds\":%d,\"track\":%d,\"volume\":%d}", 
+                        seconds, timer.track, timer.volume);
+                mqtt.publish("doorbell/timer/status", statusMsg);
+                MQTT_DEBUG_F("Timer started for %d seconds", seconds);
+            }
+            else if (strcmp(topic_copy, "doorbell/set/button/downstairs") == 0) {
+                MQTT_DEBUG("Setting downstairs button config");
+                if (doc.containsKey("track")) {
+                    config.downstairs_track = doc["track"];
+                    char debug_msg[64];
+                    snprintf(debug_msg, sizeof(debug_msg), "Set downstairs track to %d", config.downstairs_track);
+                    MQTT_DEBUG(debug_msg);
+                }
+                if (doc.containsKey("volume")) {
+                    config.downstairs_volume = doc["volume"];
+                    char debug_msg[64];
+                    snprintf(debug_msg, sizeof(debug_msg), "Set downstairs volume to %d%%", config.downstairs_volume);
+                    MQTT_DEBUG(debug_msg);
+                }
+                saveConfig();
+            }
+            else if (strcmp(topic_copy, "doorbell/set/button/door") == 0) {
+                MQTT_DEBUG("Setting door button config");
+                if (doc.containsKey("track")) {
+                    config.door_track = doc["track"];
+                    char debug_msg[64];
+                    snprintf(debug_msg, sizeof(debug_msg), "Set door track to %d", config.door_track);
+                    MQTT_DEBUG(debug_msg);
+                }
+                if (doc.containsKey("volume")) {
+                    config.door_volume = doc["volume"];
+                    char debug_msg[64];
+                    snprintf(debug_msg, sizeof(debug_msg), "Set door volume to %d%%", config.door_volume);
+                    MQTT_DEBUG(debug_msg);
+                }
+                saveConfig();
+            }
+            else if (strcmp(topic_copy, "doorbell/set/config") == 0) {
+                MQTT_DEBUG("Setting device config");
+                // Update WiFi settings
+                if (doc.containsKey("wifi_ssid")) {
+                    strlcpy(config.wifi_ssid, doc["wifi_ssid"], sizeof(config.wifi_ssid));
+                }
+                if (doc.containsKey("wifi_password")) {
+                    strlcpy(config.wifi_password, doc["wifi_password"], sizeof(config.wifi_password));
+                }
+                if (doc.containsKey("backup_wifi_ssid")) {
+                    strlcpy(config.backup_wifi_ssid, doc["backup_wifi_ssid"], sizeof(config.backup_wifi_ssid));
+                }
+                if (doc.containsKey("backup_wifi_password")) {
+                    strlcpy(config.backup_wifi_password, doc["backup_wifi_password"], sizeof(config.backup_wifi_password));
+                }
+                
+                // Update MQTT settings
+                if (doc.containsKey("mqtt_server")) {
+                    strlcpy(config.mqtt_server, doc["mqtt_server"], sizeof(config.mqtt_server));
+                }
+                if (doc.containsKey("mqtt_port")) {
+                    strlcpy(config.mqtt_port, doc["mqtt_port"], sizeof(config.mqtt_port));
+                }
+                if (doc.containsKey("backup_mqtt_server")) {
+                    strlcpy(config.backup_mqtt_server, doc["backup_mqtt_server"], sizeof(config.backup_mqtt_server));
+                }
+                if (doc.containsKey("backup_mqtt_port")) {
+                    strlcpy(config.backup_mqtt_port, doc["backup_mqtt_port"], sizeof(config.backup_mqtt_port));
+                }
+                
+                // Update debug setting
+                if (doc.containsKey("debug_enabled")) {
+                    config.debug_enabled = doc["debug_enabled"].as<bool>();
+                    MQTT_DEBUG_F("Debug mode %s", config.debug_enabled ? "enabled" : "disabled");
+                }
+                
+                saveConfig();
+            }
             return;
         }
+    }
 
-        if (!timerDoc.containsKey("seconds") || !timerDoc.containsKey("track") || !timerDoc.containsKey("volume")) {
-            mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"Missing required fields\"}");
-            MQTT_DEBUG("Error: Missing required timer fields");
-            return;
-        }
-
-        int seconds = timerDoc["seconds"].as<int>();
-        if (seconds <= 0) {
-            mqtt.publish("doorbell/timer/status", "{\"status\":\"error\",\"message\":\"Invalid duration\"}");
-            MQTT_DEBUG("Error: Invalid timer duration");
-            return;
-        }
-
-        timer.active = true;
-        timer.startTime = millis();
-        timer.durationMs = (unsigned long)seconds * 1000;
-        timer.track = timerDoc["track"].as<int>();
-        timer.volume = timerDoc["volume"].as<int>();
-
-        char statusMsg[128];
-        snprintf(statusMsg, sizeof(statusMsg), 
-                "{\"status\":\"started\",\"seconds\":%d,\"track\":%d,\"volume\":%d}", 
-                seconds, timer.track, timer.volume);
-        mqtt.publish("doorbell/timer/status", statusMsg);
-        MQTT_DEBUG_F("Timer started for %d seconds", seconds);
-        return;
-    }
-    
-    // All remaining commands require JSON
-    if (strncmp(topic_copy, "doorbell/set/", 12) != 0) {
-        MQTT_DEBUG("Error: Unknown command");
-        return;
-    }
-    
-    // Parse JSON for set commands
-    DynamicJsonDocument doc(200);
-    DeserializationError error = deserializeJson(doc, message);
-    
-    if (error) {
-        char error_msg[64];
-        snprintf(error_msg, sizeof(error_msg), "Failed to parse JSON for set command: %s", error.c_str());
-        MQTT_DEBUG(error_msg);
-        return;
-    }
-    
-    // Handle set commands (all require JSON)
-    if (strcmp(topic_copy, "doorbell/set/button/downstairs") == 0) {
-        MQTT_DEBUG("Setting downstairs button config");
-        if (doc.containsKey("track")) {
-            config.downstairs_track = doc["track"];
-            char debug_msg[64];
-            snprintf(debug_msg, sizeof(debug_msg), "Set downstairs track to %d", config.downstairs_track);
-            MQTT_DEBUG(debug_msg);
-        }
-        if (doc.containsKey("volume")) {
-            config.downstairs_volume = doc["volume"];
-            char debug_msg[64];
-            snprintf(debug_msg, sizeof(debug_msg), "Set downstairs volume to %d%%", config.downstairs_volume);
-            MQTT_DEBUG(debug_msg);
-        }
-        saveConfig();
-    }
-    else if (strcmp(topic_copy, "doorbell/set/button/door") == 0) {
-        MQTT_DEBUG("Setting door button config");
-        if (doc.containsKey("track")) {
-            config.door_track = doc["track"];
-            char debug_msg[64];
-            snprintf(debug_msg, sizeof(debug_msg), "Set door track to %d", config.door_track);
-            MQTT_DEBUG(debug_msg);
-        }
-        if (doc.containsKey("volume")) {
-            config.door_volume = doc["volume"];
-            char debug_msg[64];
-            snprintf(debug_msg, sizeof(debug_msg), "Set door volume to %d%%", config.door_volume);
-            MQTT_DEBUG(debug_msg);
-        }
-        saveConfig();
-    }
-    else if (strcmp(topic_copy, "doorbell/set/config") == 0) {
-        MQTT_DEBUG("Setting device config");
-        // Update WiFi settings
-        if (doc.containsKey("wifi_ssid")) {
-            strlcpy(config.wifi_ssid, doc["wifi_ssid"], sizeof(config.wifi_ssid));
-        }
-        if (doc.containsKey("wifi_password")) {
-            strlcpy(config.wifi_password, doc["wifi_password"], sizeof(config.wifi_password));
-        }
-        if (doc.containsKey("backup_wifi_ssid")) {
-            strlcpy(config.backup_wifi_ssid, doc["backup_wifi_ssid"], sizeof(config.backup_wifi_ssid));
-        }
-        if (doc.containsKey("backup_wifi_password")) {
-            strlcpy(config.backup_wifi_password, doc["backup_wifi_password"], sizeof(config.backup_wifi_password));
-        }
-        
-        // Update MQTT settings
-        if (doc.containsKey("mqtt_server")) {
-            strlcpy(config.mqtt_server, doc["mqtt_server"], sizeof(config.mqtt_server));
-        }
-        if (doc.containsKey("mqtt_port")) {
-            strlcpy(config.mqtt_port, doc["mqtt_port"], sizeof(config.mqtt_port));
-        }
-        if (doc.containsKey("backup_mqtt_server")) {
-            strlcpy(config.backup_mqtt_server, doc["backup_mqtt_server"], sizeof(config.backup_mqtt_server));
-        }
-        if (doc.containsKey("backup_mqtt_port")) {
-            strlcpy(config.backup_mqtt_port, doc["backup_mqtt_port"], sizeof(config.backup_mqtt_port));
-        }
-        
-        // Update debug setting
-        if (doc.containsKey("debug_enabled")) {
-            config.debug_enabled = doc["debug_enabled"].as<bool>();
-            MQTT_DEBUG_F("Debug mode %s", config.debug_enabled ? "enabled" : "disabled");
-        }
-        
-        saveConfig();
+    // If we get here and isCommand is still false, it means we didn't recognize the command
+    if (!isCommand) {
+        char errorMsg[128];
+        snprintf(errorMsg, sizeof(errorMsg), "{\"status\":\"error\",\"message\":\"Unknown command: %s\"}", topic_copy);
+        mqtt.publish("doorbell/error", errorMsg);
     }
 }
 
@@ -706,8 +731,9 @@ void reconnect() {
             mqtt.subscribe("doorbell/play/#");
             // Subscribe to system commands
             mqtt.subscribe("doorbell/system/#");
-            // Subscribe to timer commands
-            mqtt.subscribe("doorbell/timer/#");
+            // Subscribe to timer commands (but not status)
+            mqtt.subscribe("doorbell/timer/set");
+            mqtt.subscribe("doorbell/timer/stop");
             
             publishDeviceStatus();
         } else {                
@@ -844,11 +870,19 @@ void handleNormalDoorbell(int buttonIndex) {
     if (buttonIndex == 0) {  // DOWNSTAIRS
         dfPlayer.volume(percentToVolume(config.downstairs_volume));
         dfPlayer.play(config.downstairs_track);
-        MQTT_DEBUG("downstairs");
+        char eventMsg[128];
+        snprintf(eventMsg, sizeof(eventMsg), 
+                "{\"type\":\"button_press\",\"button\":\"downstairs\",\"track\":%d,\"volume\":%d}", 
+                config.downstairs_track, config.downstairs_volume);
+        mqtt.publish("doorbell/event", eventMsg);
     } else {  // DOOR
         dfPlayer.volume(percentToVolume(config.door_volume));
         dfPlayer.play(config.door_track);
-        MQTT_DEBUG("door");
+        char eventMsg[128];
+        snprintf(eventMsg, sizeof(eventMsg), 
+                "{\"type\":\"button_press\",\"button\":\"door\",\"track\":%d,\"volume\":%d}", 
+                config.door_track, config.door_volume);
+        mqtt.publish("doorbell/event", eventMsg);
     }
     delay(500);
     
@@ -856,8 +890,6 @@ void handleNormalDoorbell(int buttonIndex) {
     volumeResetTimer = currentTime;
     isPlaying = true;
     digitalWrite(LED_BUILTIN, HIGH);
-    // ledStartTime = currentTime;
-    // normalLedOn = true;
 }
 
 // Function to handle simulated button presses from MQTT
