@@ -7,6 +7,7 @@
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include "esp_task_wdt.h"
 #include "config.h"
 #include "input_config.h"
 
@@ -187,6 +188,10 @@ void checkButtons() {
 void setup() {
     Serial.begin(115200);
 
+    // Initialize watchdog: restart if loop is blocked for over 10 seconds
+    esp_task_wdt_init(10, true);
+    esp_task_wdt_add(NULL);
+
     MQTT_DEBUG_F("Starting Doorbell...");
     
     // Initialize EEPROM
@@ -309,6 +314,9 @@ void setup() {
 
 void loop() {
     ArduinoOTA.handle();
+
+    // Feed watchdog to prevent unwanted resets
+    esp_task_wdt_reset();
     
     if (!mqtt.connected()) {
         reconnect();
