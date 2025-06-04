@@ -17,7 +17,7 @@ def create_default_config():
         'password': '',
     }
     config['NTFY'] = {
-        'topic': 'exclusdoor'
+        'topic': 'doorbell'
     }
     
     with open('mqtt_config.ini', 'w') as configfile:

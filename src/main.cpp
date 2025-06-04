@@ -161,12 +161,12 @@ bool isValidButtonPress(ButtonState& state, unsigned long currentTime) {
 void checkButtons() {
     static int prevDownstairsState = -1;  // Initialize to -1 to ensure first read is always sent
     static int prevDoorState = -1;
-    unsigned long currentTime = currentTime;
+    unsigned long now = currentTime;
     
     // Check downstairs button
     int downstairsState = digitalRead(BUTTON_DOWNSTAIRS);
     buttonStates[0].isPressed = downstairsState == HIGH;
-    bool downstairsValid = isValidButtonPress(buttonStates[0], currentTime);
+    bool downstairsValid = isValidButtonPress(buttonStates[0], now);
     if (downstairsState != prevDownstairsState) {
         MQTT_DEBUG_F("Downstairs button: digitalRead=%d, isPressed=%d, wasPressed=%d, isValid=%d", 
                      downstairsState, buttonStates[0].isPressed, buttonStates[0].wasPressed, downstairsValid);
@@ -176,7 +176,7 @@ void checkButtons() {
     // Check door button
     int doorState = digitalRead(BUTTON_DOOR);
     buttonStates[1].isPressed = doorState == HIGH;
-    bool doorValid = isValidButtonPress(buttonStates[1], currentTime);
+    bool doorValid = isValidButtonPress(buttonStates[1], now);
     if (doorState != prevDoorState) {
         MQTT_DEBUG_F("Door button: digitalRead=%d, isPressed=%d, wasPressed=%d, isValid=%d", 
                      doorState, buttonStates[1].isPressed, buttonStates[1].wasPressed, doorValid);

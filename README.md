@@ -20,8 +20,9 @@ This project implements a smart doorbell system using NodeMCU32S and DFPlayer Mi
    - GND -> GND
 
 2. Buttons:
-   - Downstairs Button -> GPIO32 (and GND)
-   - Door Button -> GPIO33 (and GND)
+   - Downstairs Button -> GPIO27 (and GND)
+   - Door Button -> GPIO14 (and GND)
+   - *Analog mode uses GPIO32 and GPIO33 as ADC inputs*
 
 ## Operation Modes
 
