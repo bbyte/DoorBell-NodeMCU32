@@ -34,6 +34,7 @@ const int DFPLAYER_TX = 17;        // GPIO17 for DFPlayer TX
 const int DFPLAYER_BUSY = 26;      // GPIO26 for DFPlayer BUSY pin
 const int ADC_PIN1 = 32;           // GPIO32 for ADC reading
 const int ADC_PIN2 = 33;           // GPIO33 for ADC reading
+const int DOOR_RELAY = 4;          // GPIO4 for front door relay control
 // Built-in LED pin is already defined in framework
 
 // EEPROM size and addresses
@@ -88,8 +89,10 @@ unsigned long ledStartTime = 0;
 unsigned long lastAdcRead = 0;      // Timestamp for last ADC reading
 unsigned long currentTime = 0;      // Current time in milliseconds
 unsigned long lastPlaybackCheck = 0;  // New variable to track last playback check
+unsigned long doorRelayStartTime = 0;  // Timestamp when door relay was activated
 bool isPlaying = false;
 bool normalLedOn = false;
+bool doorRelayActive = false;       // Flag to track if door relay is currently active
 
 // Add structure for pending play requests
 struct PlayRequest {
@@ -211,6 +214,11 @@ void setup() {
     pinMode(ADC_PIN1, INPUT);
     pinMode(ADC_PIN2, INPUT);
     
+    // Configure door relay pin
+    // pinMode(DOOR_RELAY, INPUT_PULLUP);
+    pinMode(DOOR_RELAY, OUTPUT);
+    digitalWrite(DOOR_RELAY, HIGH);  // Ensure relay is off
+    
     // Check if both buttons are pressed during startup to reset config
     if (digitalRead(BUTTON_DOWNSTAIRS) == HIGH && digitalRead(BUTTON_DOOR) == HIGH) {
         MQTT_DEBUG_F("Both buttons pressed during startup - resetting to defaults");
@@ -313,17 +321,43 @@ void setup() {
 }
 
 void loop() {
+    // Handle OTA updates
     ArduinoOTA.handle();
 
     // Feed watchdog to prevent unwanted resets
     esp_task_wdt_reset();
     
+    // Check WiFi connection
+    if (WiFi.status() != WL_CONNECTED) {
+        setupWiFi();
+    }
+
+    // Check MQTT connection
     if (!mqtt.connected()) {
         reconnect();
     }
     mqtt.loop();
 
-    currentTime = millis();  // Update current time
+    // Check door relay state
+    if (doorRelayActive) {
+        currentTime = millis();  // Get current time right before we use it
+        unsigned long timeDiff;
+        if (currentTime >= doorRelayStartTime) {  // Handle normal case
+            timeDiff = currentTime - doorRelayStartTime;
+        } else {  // Handle millis() overflow
+            timeDiff = (0xFFFFFFFF - doorRelayStartTime) + currentTime;
+        }
+        MQTT_DEBUG_F("Door relay check - current: %lu, start: %lu, diff: %lu", currentTime, doorRelayStartTime, timeDiff);
+        if (timeDiff >= 5000) {  // 5 seconds timeout
+            digitalWrite(DOOR_RELAY, HIGH);
+            doorRelayActive = false;
+            MQTT_DEBUG_F("Front door relay deactivated after %lu ms", timeDiff);
+            mqtt.publish("doorbell/status", "Door relay deactivated");
+        }
+    }
+
+    // Update current time for other operations
+    currentTime = millis();
 
     // Check timer
     if (timer.active) {
@@ -709,6 +743,29 @@ void callback(char* topic, byte* payload, unsigned int length) {
         }
     }
 
+    // Handle door command
+    if (strcmp(topic_copy, "doorbell/command") == 0) {
+        if (strcmp(message, "open_front_door") == 0) {
+            // Activate door relay
+            digitalWrite(DOOR_RELAY, LOW);
+            delay(200);
+            digitalWrite(DOOR_RELAY, HIGH);
+            delay(200);
+            digitalWrite(DOOR_RELAY, LOW);
+            delay(200);
+            digitalWrite(DOOR_RELAY, HIGH);
+            delay(200);
+            digitalWrite(DOOR_RELAY, LOW);
+
+
+            doorRelayActive = true;
+            doorRelayStartTime = millis();
+            MQTT_DEBUG_F("Front door relay activated at time: %lu", doorRelayStartTime);
+            mqtt.publish("doorbell/status", "Door relay activated");
+            isCommand = true;
+        }
+    }
+
     // If we get here and isCommand is still false, it means we didn't recognize the command
     if (!isCommand) {
         char errorMsg[128];
@@ -742,6 +799,7 @@ void reconnect() {
             // Subscribe to timer commands (but not status)
             mqtt.subscribe("doorbell/timer/set");
             mqtt.subscribe("doorbell/timer/stop");
+            mqtt.subscribe("doorbell/command");
             
             publishDeviceStatus();
         } else {                

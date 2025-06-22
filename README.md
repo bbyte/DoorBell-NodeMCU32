@@ -9,6 +9,7 @@ This project implements a smart doorbell system using NodeMCU32S and DFPlayer Mi
 - 2 push buttons
 - SD card with audio files
 - Speaker for DFPlayer
+- Relay module for door control
 
 ## Wiring
 
@@ -22,6 +23,11 @@ This project implements a smart doorbell system using NodeMCU32S and DFPlayer Mi
 2. Buttons:
    - Downstairs Button -> GPIO32 (and GND)
    - Door Button -> GPIO33 (and GND)
+
+3. Door Control:
+   - Relay Control -> GPIO4
+   - VCC -> 5V or 3.3V (depending on relay module)
+   - GND -> GND
 
 ## Operation Modes
 
@@ -48,6 +54,7 @@ Note: The analog detection algorithm may need adjustment for different building 
 - Persistent configuration storage in EEPROM
 - Fallback functionality when offline
 - Timer functionality for scheduling events
+- Front door control via relay (MQTT controlled)
 
 ## MQTT Topics and Commands
 
@@ -200,6 +207,10 @@ Note: The analog detection algorithm may need adjustment for different building 
   ```bash
   mosquitto_pub -t "doorbell/timer/stop" -m ""
   ```
+
+#### Door Control
+- `doorbell/command` - Control commands
+  - `open_front_door` - Activates the front door relay for 5 seconds
 
 ### Publish Topics (Device to Server)
 
