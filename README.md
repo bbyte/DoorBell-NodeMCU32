@@ -21,8 +21,10 @@ This project implements a smart doorbell system using NodeMCU32S and DFPlayer Mi
    - GND -> GND
 
 2. Buttons:
-   - Downstairs Button -> GPIO32 (and GND)
-   - Door Button -> GPIO33 (and GND)
+   - Downstairs Button -> GPIO27 (and GND)
+   - Door Button -> GPIO14 (and GND)
+   
+   Note: GPIO32 and GPIO33 are used for ADC inputs in analog mode for voltage monitoring.
 
 3. Door Control:
    - Relay Control -> GPIO4
@@ -42,7 +44,7 @@ The current algorithm works by:
 - Analyzing the pattern of voltage changes
 - Using thresholds and timing to determine valid button presses
 
-Note: The analog detection algorithm may need adjustment for different building systems as voltage patterns can vary. You can modify the thresholds and timing parameters in the configuration.
+Note: The analog detection algorithm may need adjustment for different building systems as voltage patterns can vary. You can modify the thresholds and timing parameters in the `input_config.h` file. The algorithm uses GPIO32 and GPIO33 for ADC readings and analyzes voltage patterns over time to determine valid button presses.
 
 ## Features
 
@@ -55,6 +57,9 @@ Note: The analog detection algorithm may need adjustment for different building 
 - Fallback functionality when offline
 - Timer functionality for scheduling events
 - Front door control via relay (MQTT controlled)
+- Watchdog timer for system stability (10-second timeout)
+- Button debouncing (200ms minimum press duration)
+- Configurable button cooldown period (default 15 seconds)
 
 ## MQTT Topics and Commands
 
@@ -137,12 +142,6 @@ Note: The analog detection algorithm may need adjustment for different building 
   mosquitto_pub -t "doorbell/get/all" -m ""
   ```
 
-- `doorbell/get/status` - Request current device status
-  - No payload required
-  ```bash
-  mosquitto_pub -t "doorbell/get/status" -m ""
-  ```
-
 #### Button Configuration
 - `doorbell/set/button/downstairs` - Configure downstairs button
   ```json
@@ -210,7 +209,10 @@ Note: The analog detection algorithm may need adjustment for different building 
 
 #### Door Control
 - `doorbell/command` - Control commands
-  - `open_front_door` - Activates the front door relay for 5 seconds
+  - `open_front_door` - Activates the front door relay with a specific sequence:
+    - Sends LOW→HIGH→LOW→HIGH→LOW pulses (200ms each)
+    - Then maintains LOW state for 5 seconds
+    - Automatically returns to HIGH (off) state after timeout
 
 ### Publish Topics (Device to Server)
 
@@ -245,6 +247,14 @@ Note: The analog detection algorithm may need adjustment for different building 
 
 - `doorbell/debug` - Debug messages from the device
   - Contains various operational messages, voltage readings, and command confirmations
+
+- `doorbell/error` - Error messages from the device
+  ```json
+  {
+    "status": "error",
+    "message": "Unknown command: invalid_topic"
+  }
+  ```
 
 - `doorbell/timer/status` - Timer status updates
   ```json
@@ -353,6 +363,14 @@ All volume settings in the system are specified as percentages (0-100%). The sys
 5. Build and upload the project
 6. For subsequent updates, use OTA update functionality
 
+### Factory Reset
+To reset the device to factory defaults:
+1. Power off the device
+2. Hold both buttons (downstairs and door) pressed
+3. Power on the device while keeping buttons pressed
+4. Wait for 1 second, then release buttons
+5. The device will clear all EEPROM settings and use default configuration
+
 ## OTA Updates
 
 The device will be available as "doorbell.local" for OTA updates. You can update it using PlatformIO or Arduino IDE.
@@ -396,3 +414,22 @@ The `config.h` file is ignored by git to keep your personal settings private.
 - `DOWNSTAIRS_TRACK` - Track number for downstairs button
 - `DOOR_TRACK` - Track number for door button
 - `DEFAULT_VOLUME` - Default volume level
+
+## System Features
+
+### Watchdog Timer
+The system includes a hardware watchdog timer that automatically restarts the device if the main loop becomes unresponsive for more than 10 seconds. This ensures system reliability and prevents hanging.
+
+### Button Debouncing
+All button presses are debounced with a 200ms minimum press duration to prevent false triggers from electrical noise or mechanical bounce.
+
+### Cooldown Period
+After each button press, there's a configurable cooldown period (default 15 seconds) during which subsequent button presses are ignored to prevent spam.
+
+### Analog Mode Configuration
+When using analog input mode, the following parameters can be adjusted:
+- `ADC_THRESHOLD` - Minimum voltage to trigger detection (default ~3V)
+- `ADC_HYSTERESIS` - Voltage drop tolerance for session end
+- `MIN_SESSION_DURATION` - Minimum session length for valid detection
+- `ADC_DROPOUT_TOLERANCE` - Maximum time to ignore voltage drops
+- `MAX_SESSION_SAMPLES` - Maximum readings per session
