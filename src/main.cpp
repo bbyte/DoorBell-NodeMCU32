@@ -8,6 +8,8 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include "esp_task_wdt.h"
+#include "esp_pm.h"
+#include "esp_wifi.h"
 #include "config.h"
 #include "input_config.h"
 
@@ -90,9 +92,14 @@ unsigned long lastAdcRead = 0;      // Timestamp for last ADC reading
 unsigned long currentTime = 0;      // Current time in milliseconds
 unsigned long lastPlaybackCheck = 0;  // New variable to track last playback check
 unsigned long doorRelayStartTime = 0;  // Timestamp when door relay was activated
+unsigned long lastMemoryCheck = 0;  // For memory monitoring
+unsigned long lastWiFiCheck = 0;    // For WiFi stability checking
+unsigned long lastMQTTReconnect = 0; // To prevent rapid MQTT reconnection attempts
+unsigned long lastSystemCheck = 0;  // For system health monitoring
 bool isPlaying = false;
 bool normalLedOn = false;
 bool doorRelayActive = false;       // Flag to track if door relay is currently active
+bool systemStable = true;           // System stability flag
 
 // Add structure for pending play requests
 struct PlayRequest {
@@ -131,6 +138,9 @@ void checkButtons();
 void handleNormalDoorbell(int buttonIndex);
 void handleSimulatedButton(int button);
 void checkADC();
+void checkSystemHealth();
+void performMemoryCleanup();
+bool checkWiFiStability();
 
 // Helper function to convert percentage volume to DFPlayer volume (0-30)
 uint8_t percentToVolume(uint8_t percent) {
@@ -165,7 +175,7 @@ bool isValidButtonPress(ButtonState& state, unsigned long currentTime) {
 void checkButtons() {
     static int prevDownstairsState = -1;  // Initialize to -1 to ensure first read is always sent
     static int prevDoorState = -1;
-    unsigned long currentTime = currentTime;
+    currentTime = millis();
     
     // Check downstairs button
     int downstairsState = digitalRead(BUTTON_DOWNSTAIRS);
@@ -195,7 +205,17 @@ void setup() {
     esp_task_wdt_init(10, true);
     esp_task_wdt_add(NULL);
 
-    MQTT_DEBUG_F("Starting Doorbell...");
+    // Configure power management for stability and thermal control
+    esp_pm_config_esp32_t pm_config;
+    pm_config.max_freq_mhz = 160;      // Reduced from 240MHz to 160MHz for thermal control
+    pm_config.min_freq_mhz = 40;       // Allow CPU to scale down when idle
+    pm_config.light_sleep_enable = true; // Enable light sleep to save power
+    esp_pm_configure(&pm_config);
+
+    // Configure WiFi power saving
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM); // Enable minimal power saving
+    
+    MQTT_DEBUG_F("Starting Doorbell with thermal protection...");
     
     // Initialize EEPROM
     EEPROM.begin(EEPROM_SIZE);
@@ -321,43 +341,50 @@ void setup() {
 }
 
 void loop() {
+    // Update current time once per loop for consistency
+    currentTime = millis();
+    
     // Handle OTA updates
     ArduinoOTA.handle();
 
     // Feed watchdog to prevent unwanted resets
     esp_task_wdt_reset();
     
-    // Check WiFi connection
-    if (WiFi.status() != WL_CONNECTED) {
+    // Check system health (includes memory monitoring)
+    checkSystemHealth();
+    
+    // Check WiFi stability with improved logic
+    if (!checkWiFiStability()) {
         setupWiFi();
+        delay(1000);  // Brief pause after WiFi setup
     }
 
-    // Check MQTT connection
+    // Check MQTT connection with rate limiting
     if (!mqtt.connected()) {
         reconnect();
     }
     mqtt.loop();
 
-    // Check door relay state
+    // Check door relay state (only when active to save CPU)
     if (doorRelayActive) {
-        currentTime = millis();  // Get current time right before we use it
         unsigned long timeDiff;
         if (currentTime >= doorRelayStartTime) {  // Handle normal case
             timeDiff = currentTime - doorRelayStartTime;
         } else {  // Handle millis() overflow
             timeDiff = (0xFFFFFFFF - doorRelayStartTime) + currentTime;
         }
-        MQTT_DEBUG_F("Door relay check - current: %lu, start: %lu, diff: %lu", currentTime, doorRelayStartTime, timeDiff);
+        
         if (timeDiff >= 5000) {  // 5 seconds timeout
             digitalWrite(DOOR_RELAY, HIGH);
             doorRelayActive = false;
             MQTT_DEBUG_F("Front door relay deactivated after %lu ms", timeDiff);
-            mqtt.publish("doorbell/status", "Door relay deactivated");
+            if (mqtt.connected()) {
+                mqtt.publish("doorbell/status", "Door relay deactivated");
+            }
         }
     }
 
-    // Update current time for other operations
-    currentTime = millis();
+    // Current time already updated at loop start
 
     // Check timer
     if (timer.active) {
@@ -380,8 +407,9 @@ void loop() {
         }
     }
 
-    // Check if playback has finished
-    if (currentTime - lastPlaybackCheck >= 200) {  // Still keep the 200ms check interval
+    // Check if playback has finished (reduced frequency when not playing)
+    unsigned long checkInterval = isPlaying ? 200 : 1000;  // Check every 200ms when playing, 1s when not
+    if (currentTime - lastPlaybackCheck >= checkInterval) {
         lastPlaybackCheck = currentTime;
         
         bool isBusy = digitalRead(DFPLAYER_BUSY);
@@ -411,20 +439,28 @@ void loop() {
         MQTT_DEBUG("Playback started");
     }
 
-    // Check and handle buttons
+    // Check and handle buttons (only if not playing to reduce CPU load)
+    if (!isPlaying) {
 #ifdef INPUT_MODE_DIGITAL
-    checkButtons();
+        checkButtons();
 #else
-    checkADC();
+        checkADC();
 #endif
 
-    // Handle button actions
-    if (buttonStates[0].isValidPress) {  // Downstairs button
-        handleNormalDoorbell(0);
+        // Handle button actions
+        if (buttonStates[0].isValidPress) {  // Downstairs button
+            handleNormalDoorbell(0);
+        }
+        if (buttonStates[1].isValidPress) {  // Door button
+            handleNormalDoorbell(1);
+        }
     }
-    if (buttonStates[1].isValidPress) {  // Door button
-        handleNormalDoorbell(1);
-    }
+    
+    // Brief yield to allow other tasks to run and prevent overheating
+    yield();
+    
+    // Small delay to prevent tight loop and reduce CPU usage
+    delay(10);
 }
 
 void setupWiFi() {
@@ -775,15 +811,33 @@ void callback(char* topic, byte* payload, unsigned int length) {
 }
 
 void reconnect() {
-    while (!mqtt.connected()) {
-        MQTT_DEBUG_F("Attempting MQTT connection...");
+    unsigned long now = millis();
+    
+    // Prevent rapid reconnection attempts (wait at least 30 seconds)
+    if (now - lastMQTTReconnect < 30000) {
+        return;
+    }
+    lastMQTTReconnect = now;
+    
+    // Only try to reconnect a few times, then give up temporarily
+    static int reconnectAttempts = 0;
+    if (reconnectAttempts >= 3) {
+        MQTT_DEBUG("Too many MQTT reconnect attempts, waiting longer...");
+        reconnectAttempts = 0;
+        return;
+    }
+    
+    if (!mqtt.connected()) {
+        MQTT_DEBUG_F("Attempting MQTT connection... (attempt %d)", reconnectAttempts + 1);
+        reconnectAttempts++;
         
         // Create a random client ID
         String clientId = "DoorBell-";
         clientId += String(random(0xffff), HEX);
         
-        // Attempt to connect
+        // Attempt to connect with timeout
         if (mqtt.connect(clientId.c_str(), config.mqtt_user, config.mqtt_password)) {
+            reconnectAttempts = 0;  // Reset counter on successful connection
             MQTT_DEBUG_F("Connected to MQTT");
             
             // Subscribe to all set commands (require JSON)
@@ -880,7 +934,12 @@ void publishConfig() {
     char buffer[512];
     ArduinoJson::serializeJson(configObj, buffer);
     
-    MQTT_DEBUG("Published config");
+    if (mqtt.connected()) {
+        mqtt.publish("doorbell/config", buffer, true);  // retain flag
+        MQTT_DEBUG("Published config");
+    } else {
+        MQTT_DEBUG("Cannot publish config - MQTT not connected");
+    }
 }
 
 void clearEEPROM() {
@@ -989,8 +1048,8 @@ void analyzeSession(ADCSession& session) {
         DEBUG_PRINTLN("No button was detected at session start, ignoring");
     }
     
-    // Create JSON array of all readings
-    DynamicJsonDocument doc(16384); // Adjust size based on MAX_SESSION_SAMPLES
+    // Create JSON array of all readings (reduced size for memory efficiency)
+    DynamicJsonDocument doc(8192); // Reduced from 16KB to 8KB
     doc["status"] = "ended";
     doc["duration"] = sessionDuration;
     doc["max_voltage"] = session.maxVoltage;
@@ -1030,8 +1089,8 @@ void checkADC() {
         float voltage1 = (adc1_value * 3.3) / 4095.0;
         float voltage2 = (adc2_value * 3.3) / 4095.0;
         
-        // Print debug info every 1 second when not in a session
-        if (!currentSession.isActive && currentTime - lastDebugPrint >= 1000) {
+        // Print debug info every 5 seconds when not in a session (reduced CPU load)
+        if (!currentSession.isActive && currentTime - lastDebugPrint >= 5000) {
             DEBUG_PRINTF("ADC Values - ADC1: %d (%.2fV), ADC2: %d (%.2fV)\n", 
                         adc1_value, voltage1, adc2_value, voltage2);
             lastDebugPrint = currentTime;
@@ -1087,8 +1146,8 @@ void checkADC() {
             
             currentSession.numReadings++;
             
-            // Print debug info every 100ms during session
-            if (currentTime - lastDebugPrint >= 100) {
+            // Print debug info every 500ms during session (reduced frequency to save CPU)
+            if (currentTime - lastDebugPrint >= 500) {
                 DEBUG_PRINTF("Session ongoing - Readings: %d, ADC1: %.2fV, ADC2: %.2fV\n", 
                             currentSession.numReadings, voltage1, voltage2);
                 lastDebugPrint = currentTime;
@@ -1150,4 +1209,114 @@ void checkADC() {
         }
     }
 #endif
+}
+
+// System health monitoring function
+void checkSystemHealth() {
+    currentTime = millis();
+    
+    // Check system health every 60 seconds
+    if (currentTime - lastSystemCheck >= 60000) {
+        lastSystemCheck = currentTime;
+        
+        // Get memory info
+        uint32_t freeHeap = ESP.getFreeHeap();
+        uint32_t minFreeHeap = ESP.getMinFreeHeap();
+        uint32_t heapSize = ESP.getHeapSize();
+        
+        // Check for memory issues
+        if (freeHeap < 10000) {  // Less than 10KB free
+            MQTT_DEBUG_F("LOW MEMORY WARNING: Free heap: %u bytes", freeHeap);
+            performMemoryCleanup();
+            systemStable = false;
+        } else {
+            systemStable = true;
+        }
+        
+        // Publish system health status
+        if (mqtt.connected()) {
+            char healthMsg[256];
+            snprintf(healthMsg, sizeof(healthMsg), 
+                    "{\"free_heap\":%u,\"min_free_heap\":%u,\"heap_size\":%u,\"uptime\":%lu,\"stable\":%s}", 
+                    freeHeap, minFreeHeap, heapSize, currentTime / 1000, systemStable ? "true" : "false");
+            mqtt.publish("doorbell/health", healthMsg);
+        }
+        
+        // Check CPU temperature (if available) and throttle if needed
+        #ifdef CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ
+        float temp = temperatureRead();
+        if (temp > 70.0) {  // If temperature is above 70°C
+            MQTT_DEBUG_F("HIGH TEMPERATURE WARNING: %.1f°C - reducing CPU frequency", temp);
+            // Reduce CPU frequency for thermal protection
+            esp_pm_config_esp32_t pm_config;
+            pm_config.max_freq_mhz = 80;   // Reduce to 80MHz
+            pm_config.min_freq_mhz = 40;
+            pm_config.light_sleep_enable = true;
+            esp_pm_configure(&pm_config);
+            systemStable = false;
+        } else if (temp > 50.0 && systemStable) {
+            // Return to normal frequency if temperature is acceptable
+            esp_pm_config_esp32_t pm_config;
+            pm_config.max_freq_mhz = 160;  // Return to 160MHz
+            pm_config.min_freq_mhz = 40;
+            pm_config.light_sleep_enable = true;
+            esp_pm_configure(&pm_config);
+        }
+        #endif
+        
+        // Reset ESP if memory is critically low
+        if (freeHeap < 5000) {
+            MQTT_DEBUG("CRITICAL: Memory exhausted, restarting...");
+            delay(1000);
+            ESP.restart();
+        }
+    }
+}
+
+// Memory cleanup function
+void performMemoryCleanup() {
+    MQTT_DEBUG("Performing memory cleanup...");
+    
+    // Force garbage collection
+    yield();
+    
+    // Clear any large temporary objects
+    #ifdef INPUT_MODE_ANALOG
+    if (!currentSession.isActive) {
+        // Reset session data if not active
+        memset(&currentSession, 0, sizeof(currentSession));
+        currentSession.buttonDetected = -1;
+    }
+    #endif
+    
+    // Disconnect and reconnect WiFi if memory is very low
+    if (ESP.getFreeHeap() < 8000) {
+        MQTT_DEBUG("Critical memory - cycling WiFi connection");
+        WiFi.disconnect();
+        delay(2000);
+        setupWiFi();
+    }
+}
+
+// WiFi stability checking
+bool checkWiFiStability() {
+    currentTime = millis();
+    
+    // Check WiFi every 30 seconds
+    if (currentTime - lastWiFiCheck >= 30000) {
+        lastWiFiCheck = currentTime;
+        
+        if (WiFi.status() != WL_CONNECTED) {
+            MQTT_DEBUG("WiFi disconnected - attempting reconnection");
+            return false;
+        }
+        
+        // Check signal strength
+        int rssi = WiFi.RSSI();
+        if (rssi < -80) {  // Very weak signal
+            MQTT_DEBUG_F("Weak WiFi signal: %d dBm", rssi);
+        }
+    }
+    
+    return WiFi.status() == WL_CONNECTED;
 }
